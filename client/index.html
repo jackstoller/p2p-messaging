@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Simple P2P Chat</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+        }
+        .section {
+            margin: 20px 0;
+            padding: 15px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+        }
+        input, button {
+            padding: 8px;
+            margin: 5px;
+        }
+        #messages {
+            height: 200px;
+            overflow-y: auto;
+            border: 1px solid #ccc;
+            padding: 10px;
+            margin: 10px 0;
+            background: #f9f9f9;
+        }
+        .status {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 3px;
+        }
+        .connected { background: #d4edda; }
+        .disconnected { background: #f8d7da; }
+    </style>
+</head>
+<body>
+    <h1>Simple P2P WebRTC Chat</h1>
+    
+    <div class="section">
+        <h3>Connection</h3>
+        <input type="text" id="clientId" placeholder="Your ID" value="">
+        <button onclick="connect()">Connect to Server</button>
+        <div id="status" class="status disconnected">Disconnected</div>
+    </div>
+
+    <div class="section">
+        <h3>Start P2P Connection</h3>
+        <input type="text" id="peerId" placeholder="Peer ID to connect">
+        <button onclick="createOffer()">Connect to Peer</button>
+    </div>
+
+    <div class="section">
+        <h3>Send Message</h3>
+        <input type="text" id="messageInput" placeholder="Type a message">
+        <button onclick="sendMessage()">Send</button>
+    </div>
+
+    <div class="section">
+        <h3>Messages</h3>
+        <div id="messages"></div>
+    </div>
+
+    <script>
+        let ws;
+        let pc;
+        let dataChannel;
+        let myId;
+
+        const config = {
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' }
+            ]
+        };
+
+        function log(message) {
+            const messages = document.getElementById('messages');
+            messages.innerHTML += `<div>${new Date().toLocaleTimeString()}: ${message}</div>`;
+            messages.scrollTop = messages.scrollHeight;
+        }
+
+        function connect() {
+            myId = document.getElementById('clientId').value;
+            if (!myId) {
+                alert('Please enter your ID');
+                return;
+            }
+
+            ws = new WebSocket(`ws://localhost:8080/ws?id=${myId}`);
+
+            ws.onopen = () => {
+                document.getElementById('status').className = 'status connected';
+                document.getElementById('status').textContent = `Connected as ${myId}`;
+                log('Connected to signaling server');
+            };
+
+            ws.onclose = () => {
+                document.getElementById('status').className = 'status disconnected';
+                document.getElementById('status').textContent = 'Disconnected';
+                log('Disconnected from signaling server');
+            };
+
+            ws.onmessage = async (event) => {
+                const message = JSON.parse(event.data);
+                log(`Received ${message.type} from ${message.from}`);
+
+                if (message.type === 'offer') {
+                    await handleOffer(message);
+                } else if (message.type === 'answer') {
+                    await handleAnswer(message);
+                } else if (message.type === 'ice-candidate') {
+                    await handleIceCandidate(message);
+                }
+            };
+        }
+
+        async function createOffer() {
+            const peerId = document.getElementById('peerId').value;
+            if (!peerId) {
+                alert('Please enter peer ID');
+                return;
+            }
+
+            pc = new RTCPeerConnection(config);
+            setupPeerConnection(peerId);
+
+            // Create data channel
+            dataChannel = pc.createDataChannel('chat');
+            setupDataChannel();
+
+            // Create and send offer
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+
+            sendSignal({
+                type: 'offer',
+                from: myId,
+                to: peerId,
+                payload: offer
+            });
+
+            log(`Sent offer to ${peerId}`);
+        }
+
+        async function handleOffer(message) {
+            pc = new RTCPeerConnection(config);
+            setupPeerConnection(message.from);
+
+            // Set up data channel receiver
+            pc.ondatachannel = (event) => {
+                dataChannel = event.channel;
+                setupDataChannel();
+                log('Data channel received');
+            };
+
+            await pc.setRemoteDescription(message.payload);
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+
+            sendSignal({
+                type: 'answer',
+                from: myId,
+                to: message.from,
+                payload: answer
+            });
+
+            log(`Sent answer to ${message.from}`);
+        }
+
+        async function handleAnswer(message) {
+            await pc.setRemoteDescription(message.payload);
+            log('Connection established!');
+        }
+
+        async function handleIceCandidate(message) {
+            try {
+                await pc.addIceCandidate(message.payload);
+            } catch (e) {
+                console.error('Error adding ICE candidate:', e);
+            }
+        }
+
+        function setupPeerConnection(peerId) {
+            pc.onicecandidate = (event) => {
+                if (event.candidate) {
+                    sendSignal({
+                        type: 'ice-candidate',
+                        from: myId,
+                        to: peerId,
+                        payload: event.candidate
+                    });
+                }
+            };
+
+            pc.onconnectionstatechange = () => {
+                log(`Connection state: ${pc.connectionState}`);
+            };
+        }
+
+        function setupDataChannel() {
+            dataChannel.onopen = () => {
+                log('Data channel is open!');
+            };
+
+            dataChannel.onmessage = (event) => {
+                log(`Peer: ${event.data}`);
+            };
+
+            dataChannel.onclose = () => {
+                log('Data channel closed');
+            };
+        }
+
+        function sendSignal(message) {
+            ws.send(JSON.stringify(message));
+        }
+
+        function sendMessage() {
+            const input = document.getElementById('messageInput');
+            const message = input.value;
+            
+            if (!dataChannel || dataChannel.readyState !== 'open') {
+                alert('Data channel is not open');
+                return;
+            }
+
+            dataChannel.send(message);
+            log(`You: ${message}`);
+            input.value = '';
+        }
+    </script>
+</body>
+</html>
