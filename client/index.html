@@ -36,6 +36,16 @@
         }
         .connected { background: #d4edda; }
         .disconnected { background: #f8d7da; }
+        .signature-box {
+            padding: 10px;
+            margin: 10px 0;
+            border: 1px solid #ccc;
+            border-radius: 3px;
+            background: #f9f9f9;
+            font-family: monospace;
+            font-size: 16px;
+            letter-spacing: 1px;
+        }
     </style>
 </head>
 <body>
@@ -52,6 +62,8 @@
         <h3>Start P2P Connection</h3>
         <input type="text" id="peerId" placeholder="Peer ID to connect">
         <button onclick="createOffer()">Connect to Peer</button>
+        <button onclick="refreshSignature()">Refresh E2E Signature</button>
+        <div id="signature" class="signature-box">E2E Signature: Not available</div>
     </div>
 
     <div class="section">
@@ -70,6 +82,8 @@
         let pc;
         let dataChannel;
         let myId;
+        let activePeerId;
+        let lastSignature;
 
         const config = {
             iceServers: [
@@ -83,6 +97,139 @@
             messages.scrollTop = messages.scrollHeight;
         }
 
+        function resetSignature() {
+            lastSignature = null;
+            document.getElementById('signature').textContent = 'E2E Signature: Not available';
+        }
+
+        function setSignature(signature) {
+            document.getElementById('signature').textContent = `E2E Signature: ${signature}`;
+        }
+
+        function normalizeFingerprint(fingerprint) {
+            return (fingerprint || '').replace(/:/g, '').toUpperCase();
+        }
+
+        function formatSignature(hex) {
+            return hex.slice(0, 24).match(/.{1,4}/g).join('-');
+        }
+
+        async function computeDigestHex(input) {
+            if (!window.crypto || !window.crypto.subtle) {
+                throw new Error('Web Crypto API is not available; cannot compute a secure E2E signature');
+            }
+
+            const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input));
+            return Array.from(new Uint8Array(digest))
+                .map((byte) => byte.toString(16).padStart(2, '0'))
+                .join('')
+                .toUpperCase();
+        }
+
+        function extractFingerprintFromSdp(description) {
+            if (!description || !description.sdp) {
+                return '';
+            }
+
+            const lines = description.sdp.split('\n');
+            for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed.startsWith('a=fingerprint:')) {
+                    continue;
+                }
+
+                const parts = trimmed.split(' ');
+                if (parts.length < 2) {
+                    continue;
+                }
+
+                return normalizeFingerprint(parts[1]);
+            }
+
+            return '';
+        }
+
+        async function derivePeerSignature() {
+            if (!pc) {
+                return null;
+            }
+
+            const stats = await pc.getStats();
+            let localFingerprint = '';
+            let remoteFingerprint = '';
+
+            const certificateReports = new Map();
+            stats.forEach((report) => {
+                if (report.type === 'certificate') {
+                    const fp = normalizeFingerprint(report.fingerprint || report.fingerprintSha256);
+                    if (fp) {
+                        certificateReports.set(report.id, fp);
+                    }
+                }
+            });
+
+            stats.forEach((report) => {
+                if (report.type !== 'transport') {
+                    return;
+                }
+
+                const localCertFingerprint = certificateReports.get(report.localCertificateId);
+                const remoteCertFingerprint = certificateReports.get(report.remoteCertificateId);
+
+                if (!localCertFingerprint || !remoteCertFingerprint) {
+                    return;
+                }
+
+                localFingerprint = localCertFingerprint;
+                remoteFingerprint = remoteCertFingerprint;
+            });
+
+            if (!localFingerprint || !remoteFingerprint) {
+                localFingerprint = extractFingerprintFromSdp(pc.localDescription);
+                remoteFingerprint = extractFingerprintFromSdp(pc.remoteDescription);
+            }
+
+            if (!localFingerprint || !remoteFingerprint) {
+                return null;
+            }
+
+            const canonicalPair = [localFingerprint, remoteFingerprint].sort().join('|');
+            const digestHex = await computeDigestHex(canonicalPair);
+
+            return formatSignature(digestHex);
+        }
+
+        async function updatePeerSignature() {
+            try {
+                const signature = await derivePeerSignature();
+                if (!signature || signature === lastSignature) {
+                    return false;
+                }
+
+                lastSignature = signature;
+                setSignature(signature);
+                log(`E2E signature with ${activePeerId || 'peer'}: ${signature}`);
+                return true;
+            } catch (error) {
+                console.error('Could not derive E2E signature:', error);
+                setSignature('Error: secure E2E signature unavailable');
+                log(`E2E signature error: ${error.message}`);
+                return false;
+            }
+        }
+
+        async function refreshSignature() {
+            if (!pc) {
+                alert('No active peer connection yet');
+                return;
+            }
+
+            const updated = await updatePeerSignature();
+            if (!updated) {
+                log('E2E signature still unavailable; try again in a moment');
+            }
+        }
+
         function connect() {
             myId = document.getElementById('clientId').value;
             if (!myId) {
@@ -90,7 +237,7 @@
                 return;
             }
 
-            ws = new WebSocket(`ws://localhost:8080/ws?id=${myId}`);
+            ws = new WebSocket(`ws://${location.host}/ws?id=${myId}`);
 
             ws.onopen = () => {
                 document.getElementById('status').className = 'status connected';
@@ -101,6 +248,7 @@
             ws.onclose = () => {
                 document.getElementById('status').className = 'status disconnected';
                 document.getElementById('status').textContent = 'Disconnected';
+                resetSignature();
                 log('Disconnected from signaling server');
             };
 
@@ -125,6 +273,8 @@
                 return;
             }
 
+            activePeerId = peerId;
+            resetSignature();
             pc = new RTCPeerConnection(config);
             setupPeerConnection(peerId);
 
@@ -147,6 +297,8 @@
         }
 
         async function handleOffer(message) {
+            activePeerId = message.from;
+            resetSignature();
             pc = new RTCPeerConnection(config);
             setupPeerConnection(message.from);
 
@@ -174,6 +326,7 @@
         async function handleAnswer(message) {
             await pc.setRemoteDescription(message.payload);
             log('Connection established!');
+            updatePeerSignature();
         }
 
         async function handleIceCandidate(message) {
@@ -198,12 +351,19 @@
 
             pc.onconnectionstatechange = () => {
                 log(`Connection state: ${pc.connectionState}`);
+                if (pc.connectionState === 'connected') {
+                    updatePeerSignature();
+                }
+                if (pc.connectionState === 'closed' || pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
+                    resetSignature();
+                }
             };
         }
 
         function setupDataChannel() {
             dataChannel.onopen = () => {
                 log('Data channel is open!');
+                updatePeerSignature();
             };
 
             dataChannel.onmessage = (event) => {

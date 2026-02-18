@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"sync"
@@ -186,7 +185,7 @@ func main() {
 
 	// Simple health check
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "P2P Signaling Server Running\n")
+		http.ServeFile(w, r, "../client/index.html")
 	})
 
 	port := ":8080"
