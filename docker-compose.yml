@@ -1,0 +1,80 @@
+version: "3.9"
+
+# Three-node development cluster.
+# Nodes use Docker's internal DNS so no stable IPs are needed.
+# node1 is the bootstrap seed for node2 and node3.
+#
+# Run:
+#   docker compose up --build
+#
+# Bring a node down to test crash recovery:
+#   docker compose stop node2
+
+services:
+  node1:
+    build: .
+    command: >
+      -id=node1
+        -listen=:9000
+        -advertise=node1:9000
+        -db=/data/node1.db
+        -replicas=2
+        -ca-cert=/certs/ca.crt
+        -node-cert=/certs/node1.crt
+        -node-key=/certs/node1.key
+    volumes:
+      - node1-data:/data
+      - ./certs:/certs:ro
+    networks:
+      - mesh
+    ports:
+      - "9001:9000"   # expose for debugging; not required internally
+
+  node2:
+    build: .
+    command: >
+      -id=node2
+        -listen=:9000
+        -advertise=node2:9000
+        -peers=node1:9000
+        -db=/data/node2.db
+        -replicas=2
+        -ca-cert=/certs/ca.crt
+        -node-cert=/certs/node2.crt
+        -node-key=/certs/node2.key
+    volumes:
+      - node2-data:/data
+      - ./certs:/certs:ro
+    networks:
+      - mesh
+    depends_on:
+      - node1
+
+  node3:
+    build: .
+    command: >
+      -id=node3
+        -listen=:9000
+        -advertise=node3:9000
+        -peers=node1:9000
+        -db=/data/node3.db
+        -replicas=2
+        -ca-cert=/certs/ca.crt
+        -node-cert=/certs/node3.crt
+        -node-key=/certs/node3.key
+    volumes:
+      - node3-data:/data
+      - ./certs:/certs:ro
+    networks:
+      - mesh
+    depends_on:
+      - node1
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+
+networks:
+  mesh:
+    driver: bridge

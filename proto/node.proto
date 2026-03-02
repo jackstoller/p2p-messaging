@@ -1,0 +1,248 @@
+syntax = "proto3";
+package node;
+option go_package = "github.com/jackstoller/p2p-messaging/proto/node;node";
+
+// ─────────────────────────────────────────────
+// Shared types
+// ─────────────────────────────────────────────
+
+message VirtualNode {
+  string node_id     = 1; // physical node this vnode belongs to
+  uint64 position    = 2; // position on the ring (hash output)
+  string address     = 3; // gRPC address of the physical node
+}
+
+message Member {
+  string          node_id  = 1;
+  string          address  = 2;
+  repeated VirtualNode vnodes = 3;
+  MemberStatus    status   = 4;
+}
+
+enum MemberStatus {
+  PENDING  = 0;
+  ACTIVE   = 1;
+  LEAVING  = 2;
+  DEAD     = 3;
+}
+
+// TODO: Make this generic
+message UserRecord {
+  string username    = 1;
+  string node_id     = 2; // node the user is currently connected to
+  int64  updated_at  = 3; // unix millis — used for conflict resolution
+}
+
+message Range {
+  uint64 start = 1; // exclusive
+  uint64 end   = 2; // inclusive
+}
+
+// ─────────────────────────────────────────────
+// Membership service
+// ─────────────────────────────────────────────
+
+service MembershipService {
+  // New node → seed: "I exist, here are my vnodes"
+  rpc Announce(AnnounceRequest) returns (AnnounceResponse);
+
+  // New node → seed: "Give me the full member list"
+  rpc SyncMembers(SyncMembersRequest) returns (SyncMembersResponse);
+
+  // Any node → any node: periodic liveness check
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // Node → all: "I think this node is dead"
+  rpc SuspectNode(SuspectRequest) returns (SuspectResponse);
+
+  // Node → all: "Quorum confirms this node is dead"
+  rpc ConfirmDead(ConfirmDeadRequest) returns (ConfirmDeadResponse);
+
+  // Node → all: incremental membership change after resolution
+  rpc MembershipUpdate(MembershipUpdateRequest) returns (MembershipUpdateResponse);
+}
+
+message AnnounceRequest {
+  Member member = 1;
+}
+message AnnounceResponse {
+  bool accepted = 1;
+}
+
+message SyncMembersRequest {
+  string requesting_node_id = 1; // TODO: Is this necessary?
+}
+message SyncMembersResponse {
+  repeated Member members = 1;
+}
+
+message HeartbeatRequest {
+  string node_id  = 1;
+  int64  sent_at  = 2; // unix millis
+}
+message HeartbeatResponse {
+  string node_id       = 1;
+  int64  sent_at       = 2;
+  int64  received_at   = 3;
+}
+
+message SuspectRequest {
+  string suspected_node_id = 1;
+  string reporter_node_id  = 2;
+  int64  reported_at       = 3;
+}
+message SuspectResponse {}
+
+message ConfirmDeadRequest {
+  string dead_node_id          = 1;
+  repeated string confirmed_by = 2; // node IDs that agreed
+}
+message ConfirmDeadResponse {}
+
+message MembershipUpdateRequest {
+  enum UpdateType {
+    JOIN  = 0;
+    LEAVE = 1;
+    DEAD  = 2;
+  }
+  UpdateType update_type = 1;
+  Member     member      = 2;
+}
+message MembershipUpdateResponse {}
+
+// ─────────────────────────────────────────────
+// Transfer service  (join data handoff)
+// ─────────────────────────────────────────────
+
+service TransferService {
+  // Joiner → predecessor: "I own this range, start transferring"
+  rpc InitiateTransfer(InitiateTransferRequest) returns (InitiateTransferResponse);
+
+  // Predecessor → joiner: stream records in range
+  rpc StreamDataSlice(StreamDataSliceRequest) returns (stream DataChunk);
+
+  // Predecessor → joiner: live write forwarding during transfer window
+  rpc ForwardWrite(ForwardWriteRequest) returns (ForwardWriteResponse);
+
+  // Joiner → predecessor: "I have everything, ready to take over"
+  rpc ConfirmReady(ConfirmReadyRequest) returns (ConfirmReadyResponse);
+
+  // Predecessor → joiner: "You are now primary"
+  rpc HandoffAuthority(HandoffAuthorityRequest) returns (HandoffAuthorityResponse);
+}
+
+message InitiateTransferRequest {
+  string transfer_id  = 1;
+  string new_node_id  = 2;
+  Range  range        = 3;
+}
+message InitiateTransferResponse {
+  bool accepted = 1;
+}
+
+message StreamDataSliceRequest {
+  string transfer_id = 1;
+  Range  range       = 2;
+}
+message DataChunk {
+  string       transfer_id  = 1;
+  int32        chunk_index  = 2;
+  bool         is_final     = 3;
+  repeated UserRecord records = 4;
+}
+
+message ForwardWriteRequest {
+  string     transfer_id = 1;
+  string     write_id    = 2;
+  UserRecord record      = 3;
+}
+message ForwardWriteResponse {
+  string write_id = 1;
+}
+
+message ConfirmReadyRequest {
+  string transfer_id = 1;
+}
+message ConfirmReadyResponse {
+  bool proceed = 1; // false = predecessor not ready, retry
+}
+
+message HandoffAuthorityRequest {
+  string transfer_id = 1;
+  Range  range       = 2;
+}
+message HandoffAuthorityResponse {
+  bool acknowledged = 1;
+}
+
+// ─────────────────────────────────────────────
+// Replication service
+// ─────────────────────────────────────────────
+
+service ReplicationService {
+  // Primary → replica: write a record
+  rpc Replicate(ReplicateRequest) returns (ReplicateResponse);
+
+  // Primary → stale replica: drop records in range, you're no longer a replica
+  rpc DropReplica(DropReplicaRequest) returns (DropReplicaResponse);
+
+  // Surviving replica → self (internal) or triggered externally after crash
+  rpc PromoteReplica(PromoteReplicaRequest) returns (PromoteReplicaResponse);
+}
+
+message ReplicateRequest {
+  UserRecord record     = 1;
+  string     primary_id = 2;
+  int64      version    = 3;
+}
+message ReplicateResponse {
+  bool   success = 1;
+  int64  version = 2;
+}
+
+message DropReplicaRequest {
+  Range  range        = 1;
+  string requester_id = 2;
+}
+message DropReplicaResponse {
+  bool success = 1;
+}
+
+message PromoteReplicaRequest {
+  Range  range    = 1;
+  string new_primary_id = 2;
+}
+message PromoteReplicaResponse {
+  bool success = 1;
+}
+
+// ─────────────────────────────────────────────
+// Data service  (inter-node record access)
+// ─────────────────────────────────────────────
+
+service DataService {
+  // Route a read to the correct node
+  rpc ReadRecord(ReadRecordRequest) returns (ReadRecordResponse);
+
+  // Route a write to the correct node
+  rpc WriteRecord(WriteRecordRequest) returns (WriteRecordResponse);
+}
+
+message ReadRecordRequest {
+  string username      = 1; // TODO: Make generic
+  string requester_id  = 2;
+}
+message ReadRecordResponse {
+  UserRecord record  = 1;
+  bool       found   = 2;
+  bool       stale   = 3; // true if served from replica due to primary unreachable
+}
+
+message WriteRecordRequest {
+  UserRecord record      = 1;
+  string     requester_id = 2;
+}
+message WriteRecordResponse {
+  bool  success = 1;
+  int64 version = 2;
+}
