@@ -11,6 +11,8 @@ import (
 	"github.com/jackstoller/p2p-messaging/internal/storage"
 	"github.com/jackstoller/p2p-messaging/internal/transfer"
 	pb "github.com/jackstoller/p2p-messaging/proto/node"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // Node implements all four gRPC services.
@@ -117,6 +119,9 @@ func (n *Node) MembershipUpdate(_ context.Context, req *pb.MembershipUpdateReque
 	switch req.UpdateType {
 	case pb.MembershipUpdateRequest_JOIN:
 		n.mgr.AddPending(*protoMember(req.Member))
+		if err := n.mgr.Activate(req.Member.NodeId); err != nil {
+			slog.Warn("failed to activate joined node", "nodeID", req.Member.NodeId, "err", err)
+		}
 	case pb.MembershipUpdateRequest_DEAD:
 		n.mgr.MarkDead(req.Member.NodeId)
 		if n.onDead != nil {
@@ -171,18 +176,73 @@ func (n *Node) ConfirmReady(ctx context.Context, req *pb.ConfirmReadyRequest) (*
 	//
 	// Simpler: we handle HandoffAuthority as a separate outbound RPC from the predecessor
 	// after returning Proceed=true. The joiner waits for it.
-	go n.sendHandoffAuthority(ctx, req.TransferId)
+	go n.sendHandoffAuthority(req.TransferId)
 
 	return &pb.ConfirmReadyResponse{Proceed: true}, nil
 }
 
-func (n *Node) sendHandoffAuthority(ctx context.Context, transferID string) {
-	// Look up the new node's address and range.
-	// (In a fuller impl, outboundState would be accessible from the server layer.
-	// For now, the transfer manager exposes what we need.)
-	// This is a design seam — wire transfer.Manager to expose outbound state,
-	// or have the server layer hold a reference it can query.
-	slog.Info("sending HandoffAuthority", "transferID", transferID)
+func (n *Node) sendHandoffAuthority(transferID string) {
+	info, ok := n.xfer.OutboundInfo(transferID)
+	if !ok {
+		slog.Warn("handoff: transfer not found", "transferID", transferID)
+		return
+	}
+
+	var newNodeAddr string
+	for _, mem := range n.mgr.AllMembers() {
+		if mem.NodeID == info.NewNodeID {
+			newNodeAddr = mem.Address
+			break
+		}
+	}
+	if newNodeAddr == "" {
+		slog.Error("handoff: new node address not found", "transferID", transferID, "newNodeID", info.NewNodeID)
+		return
+	}
+
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		attemptCtx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+
+		client, err := n.mgr.TransferClient(attemptCtx, newNodeAddr)
+		if err == nil {
+			resp, callErr := client.HandoffAuthority(attemptCtx, &pb.HandoffAuthorityRequest{
+				TransferId: transferID,
+				Range: &pb.Range{
+					Start: info.RangeStart,
+					End:   info.RangeEnd,
+				},
+			})
+			cancel()
+
+			if callErr == nil {
+				if !resp.Acknowledged {
+					slog.Warn("handoff: not acknowledged", "transferID", transferID)
+					return
+				}
+				n.xfer.HandleHandoffAck(transferID)
+				slog.Info("handoff complete", "transferID", transferID, "to", info.NewNodeID)
+				return
+			}
+
+			if st, ok := status.FromError(callErr); ok {
+				if st.Code() != codes.Canceled && st.Code() != codes.DeadlineExceeded && st.Code() != codes.Unavailable {
+					slog.Error("handoff: rpc failed", "transferID", transferID, "err", callErr)
+					return
+				}
+			}
+			err = callErr
+		} else {
+			cancel()
+		}
+
+		if time.Now().After(deadline) {
+			slog.Error("handoff: rpc failed after retries", "transferID", transferID, "address", newNodeAddr, "err", err)
+			return
+		}
+
+		time.Sleep(200 * time.Millisecond)
+	}
 }
 
 // HandoffAuthority is received by the JOINER from the predecessor.
@@ -199,8 +259,6 @@ func (n *Node) HandoffAuthority(_ context.Context, req *pb.HandoffAuthorityReque
 	_ = n.mgr.Activate(n.nodeID)
 
 	// Notify the predecessor that handoff is complete (they will drop to replica).
-	n.xfer.HandleHandoffAck(req.TransferId)
-
 	return &pb.HandoffAuthorityResponse{Acknowledged: true}, nil
 }
 

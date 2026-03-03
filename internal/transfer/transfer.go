@@ -52,6 +52,12 @@ type outboundState struct {
 	readyC          chan struct{} // closed when ConfirmReady arrives
 }
 
+type OutboundInfo struct {
+	NewNodeID  string
+	RangeStart uint64
+	RangeEnd   uint64
+}
+
 func New(mgr *membership.Manager, store *storage.Store, nodeID string) *Manager {
 	return &Manager{
 		mgr:      mgr,
@@ -178,12 +184,22 @@ func (m *Manager) claimRange(ctx context.Context, r ring.OwnedRange) error {
 	// In practice we wait briefly for any in-flight forwards to land.
 	time.Sleep(50 * time.Millisecond)
 
-	// Step 4: ConfirmReady
-	readyResp, err := client.ConfirmReady(ctx, &pb.ConfirmReadyRequest{
-		TransferId: transferID,
-	})
-	if err != nil || !readyResp.Proceed {
-		return fmt.Errorf("ConfirmReady failed: %w", err)
+	// Step 4: ConfirmReady (retry while predecessor is draining in-flight writes).
+	confirmDeadline := time.Now().Add(8 * time.Second)
+	for {
+		readyResp, err := client.ConfirmReady(ctx, &pb.ConfirmReadyRequest{
+			TransferId: transferID,
+		})
+		if err != nil {
+			return fmt.Errorf("ConfirmReady failed: %w", err)
+		}
+		if readyResp.Proceed {
+			break
+		}
+		if time.Now().After(confirmDeadline) {
+			return fmt.Errorf("ConfirmReady timed out waiting for predecessor to be ready")
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	// Step 5: Predecessor sends HandoffAuthority (we receive it via the
@@ -191,7 +207,7 @@ func (m *Manager) claimRange(ctx context.Context, r ring.OwnedRange) error {
 	// ConfirmReady response implicitly triggers predecessor to send it.
 	// We block briefly waiting for the HandoffAuthority RPC to arrive.
 	// In a production impl this would be a channel; here we poll the DB.
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
 		ranges, _ := m.store.GetOwnedRanges()
 		for _, or_ := range ranges {
@@ -359,6 +375,22 @@ func (m *Manager) HandleHandoffAck(transferID string) {
 	_ = m.store.SetRange(transferID, state.rangeStart, state.rangeEnd, storage.RoleReplica)
 	slog.Info("handed off authority, now replica",
 		"transferID", transferID, "start", state.rangeStart, "end", state.rangeEnd)
+}
+
+// OutboundInfo returns the transfer metadata needed to send HandoffAuthority.
+func (m *Manager) OutboundInfo(transferID string) (OutboundInfo, bool) {
+	m.outboundMu.Lock()
+	state, ok := m.outbound[transferID]
+	m.outboundMu.Unlock()
+	if !ok {
+		return OutboundInfo{}, false
+	}
+
+	return OutboundInfo{
+		NewNodeID:  state.newNodeID,
+		RangeStart: state.rangeStart,
+		RangeEnd:   state.rangeEnd,
+	}, true
 }
 
 // ─── CRASH RECOVERY ──────────────────────────────────────────────────────────

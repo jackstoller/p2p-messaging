@@ -3,6 +3,7 @@ package heartbeat
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/jackstoller/p2p-messaging/internal/membership"
@@ -20,6 +21,7 @@ const (
 // report. When quorum agrees, it calls onConfirmDead.
 type Monitor struct {
 	mgr           *membership.Manager
+	mu            sync.Mutex
 	missCount     map[string]int // nodeID → consecutive misses
 	onConfirmDead func(nodeID string)
 }
@@ -78,13 +80,12 @@ func (m *Monitor) ping(ctx context.Context, self membership.Member, peer members
 	}
 
 	// Successful pong - clear any miss history.
-	m.missCount[peer.NodeID] = 0
+	m.setMissCount(peer.NodeID, 0)
 	m.mgr.ClearSuspect(peer.NodeID)
 }
 
 func (m *Monitor) recordMiss(ctx context.Context, self membership.Member, nodeID string) {
-	m.missCount[nodeID]++
-	misses := m.missCount[nodeID]
+	misses := m.incrementMissCount(nodeID)
 
 	slog.Warn("heartbeat miss", "node", nodeID, "consecutive", misses)
 
@@ -103,8 +104,28 @@ func (m *Monitor) recordMiss(ctx context.Context, self membership.Member, nodeID
 		if m.onConfirmDead != nil {
 			m.onConfirmDead(nodeID)
 		}
-		delete(m.missCount, nodeID)
+		m.deleteMissCount(nodeID)
 	}
+}
+
+func (m *Monitor) setMissCount(nodeID string, count int) {
+	m.mu.Lock()
+	m.missCount[nodeID] = count
+	m.mu.Unlock()
+}
+
+func (m *Monitor) incrementMissCount(nodeID string) int {
+	m.mu.Lock()
+	m.missCount[nodeID]++
+	count := m.missCount[nodeID]
+	m.mu.Unlock()
+	return count
+}
+
+func (m *Monitor) deleteMissCount(nodeID string) {
+	m.mu.Lock()
+	delete(m.missCount, nodeID)
+	m.mu.Unlock()
 }
 
 func (m *Monitor) gossipSuspect(ctx context.Context, self membership.Member, nodeID string) {
