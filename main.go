@@ -159,11 +159,10 @@ func joinNetwork(
 	selfProto := membership.MemberToProto(self)
 	for _, peer := range mgr.ActiveMembers() {
 		go func(peer membership.Member) {
-			client, conn, err := mgr.MembershipClient(ctx, peer.Address)
+			client, err := mgr.MembershipClient(ctx, peer.Address)
 			if err != nil {
 				return
 			}
-			defer conn.Close()
 			_, _ = client.Announce(ctx, &pb.AnnounceRequest{Member: selfProto})
 		}(peer)
 	}
@@ -201,11 +200,10 @@ func joinNetwork(
 	selfProto.Status = pb.MemberStatus_ACTIVE
 	for _, peer := range mgr.ActiveMembers() {
 		go func(peer membership.Member) {
-			client, conn, err := mgr.MembershipClient(ctx, peer.Address)
+			client, err := mgr.MembershipClient(ctx, peer.Address)
 			if err != nil {
 				return
 			}
-			defer conn.Close()
 			_, _ = client.MembershipUpdate(ctx, &pb.MembershipUpdateRequest{
 				UpdateType: pb.MembershipUpdateRequest_JOIN,
 				Member:     selfProto,

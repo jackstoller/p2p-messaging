@@ -62,12 +62,11 @@ func (m *Monitor) ping(ctx context.Context, self membership.Member, peer members
 	pingCtx, cancel := context.WithTimeout(ctx, Timeout)
 	defer cancel()
 
-	client, conn, err := m.mgr.MembershipClient(pingCtx, peer.Address)
+	client, err := m.mgr.MembershipClient(pingCtx, peer.Address)
 	if err != nil {
 		m.recordMiss(ctx, self, peer.NodeID)
 		return
 	}
-	defer conn.Close()
 
 	_, err = client.Heartbeat(pingCtx, &pb.HeartbeatRequest{
 		NodeId: self.NodeID,
@@ -117,11 +116,10 @@ func (m *Monitor) gossipSuspect(ctx context.Context, self membership.Member, nod
 		go func(peer membership.Member) {
 			gCtx, cancel := context.WithTimeout(ctx, Timeout)
 			defer cancel()
-			client, conn, err := m.mgr.MembershipClient(gCtx, peer.Address)
+			client, err := m.mgr.MembershipClient(gCtx, peer.Address)
 			if err != nil {
 				return
 			}
-			defer conn.Close()
 			_, _ = client.SuspectNode(gCtx, &pb.SuspectRequest{
 				SuspectedNodeId: nodeID,
 				ReporterNodeId:  self.NodeID,
@@ -141,11 +139,10 @@ func (m *Monitor) gossipConfirmDead(ctx context.Context, self membership.Member,
 		go func(peer membership.Member) {
 			gCtx, cancel := context.WithTimeout(ctx, Timeout)
 			defer cancel()
-			client, conn, err := m.mgr.MembershipClient(gCtx, peer.Address)
+			client, err := m.mgr.MembershipClient(gCtx, peer.Address)
 			if err != nil {
 				return
 			}
-			defer conn.Close()
 			_, _ = client.ConfirmDead(gCtx, &pb.ConfirmDeadRequest{
 				DeadNodeId:  nodeID,
 				ConfirmedBy: confirmedBy,

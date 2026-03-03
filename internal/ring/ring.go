@@ -8,7 +8,7 @@ import (
 	"sync"
 )
 
-const DefaultVirtualNodes = 150
+const DefaultVirtualNodes = 5
 
 // Point is one virtual node's position on the ring.
 type Point struct {

@@ -271,12 +271,11 @@ func (n *Node) ReadRecord(ctx context.Context, req *pb.ReadRecordRequest) (*pb.R
 	}
 
 	// Forward to primary.
-	client, conn, err := n.mgr.DataClient(ctx, primary.Address)
+	client, err := n.mgr.DataClient(ctx, primary.Address)
 	if err != nil {
 		// Primary unreachable — try a replica and flag as stale.
 		return n.readFromReplica(ctx, req)
 	}
-	defer conn.Close()
 
 	resp, err := client.ReadRecord(ctx, req)
 	if err != nil {
@@ -304,12 +303,11 @@ func (n *Node) readFromReplica(ctx context.Context, req *pb.ReadRecordRequest) (
 				},
 			}, nil
 		}
-		client, conn, err := n.mgr.DataClient(ctx, node.Address)
+		client, err := n.mgr.DataClient(ctx, node.Address)
 		if err != nil {
 			continue
 		}
 		resp, err := client.ReadRecord(ctx, req)
-		conn.Close()
 		if err == nil {
 			resp.Stale = true
 			return resp, nil
@@ -327,11 +325,10 @@ func (n *Node) WriteRecord(ctx context.Context, req *pb.WriteRecordRequest) (*pb
 
 	// Forward to primary if we're not it.
 	if primary.NodeID != n.nodeID {
-		client, conn, err := n.mgr.DataClient(ctx, primary.Address)
+		client, err := n.mgr.DataClient(ctx, primary.Address)
 		if err != nil {
 			return nil, fmt.Errorf("WriteRecord: cannot reach primary: %w", err)
 		}
-		defer conn.Close()
 		return client.WriteRecord(ctx, req)
 	}
 
@@ -354,12 +351,11 @@ func (n *Node) WriteRecord(ctx context.Context, req *pb.WriteRecordRequest) (*pb
 
 	for _, node := range replicas[1:] { // [0] is self
 		go func(node ring.Point) {
-			client, conn, err := n.mgr.ReplicationClient(ctx, node.Address)
+			client, err := n.mgr.ReplicationClient(ctx, node.Address)
 			if err != nil {
 				ackCh <- err
 				return
 			}
-			defer conn.Close()
 			_, err = client.Replicate(ctx, &pb.ReplicateRequest{
 				Record: &pb.UserRecord{
 					Username:  rec.Username,

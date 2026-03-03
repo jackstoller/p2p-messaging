@@ -129,11 +129,10 @@ func (m *Manager) claimRange(ctx context.Context, r ring.OwnedRange) error {
 	// Mark range as TRANSFERRING in local DB.
 	_ = m.store.SetRange(r.VnodeID, r.Start, r.End, storage.RoleTransferring)
 
-	client, conn, err := m.mgr.TransferClient(ctx, predecessor.Address)
+	client, err := m.mgr.TransferClient(ctx, predecessor.Address)
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
 
 	// Step 1: InitiateTransfer
 	resp, err := client.InitiateTransfer(ctx, &pb.InitiateTransferRequest{
@@ -166,7 +165,7 @@ func (m *Manager) claimRange(ctx context.Context, r ring.OwnedRange) error {
 				Username:  rec.Username,
 				NodeID:    rec.NodeId,
 				RingPos:   ring.KeyPosition(rec.Username),
-				Version:   int64(chunk.ChunkIndex), // temporary; real version set on upsert
+				Version:   int64(chunk.ChunkIndex), // temporary, real version set on upsert
 				UpdatedAt: rec.UpdatedAt,
 			})
 		}
@@ -295,11 +294,10 @@ func (m *Manager) ForwardWrite(ctx context.Context, transferID string, rec stora
 		return fmt.Errorf("transfer: new node %s not found", state.newNodeID)
 	}
 
-	client, conn, err := m.mgr.TransferClient(ctx, newNodeAddr)
+	client, err := m.mgr.TransferClient(ctx, newNodeAddr)
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
 
 	_, err = client.ForwardWrite(ctx, &pb.ForwardWriteRequest{
 		TransferId: transferID,
@@ -428,12 +426,11 @@ func (m *Manager) replicateRangeToNode(
 	records []storage.UserRecord,
 	r storage.OwnedRangeRow,
 ) {
-	client, conn, err := m.mgr.ReplicationClient(ctx, address)
+	client, err := m.mgr.ReplicationClient(ctx, address)
 	if err != nil {
 		slog.Error("replication: dial failed", "address", address, "err", err)
 		return
 	}
-	defer conn.Close()
 
 	for _, rec := range records {
 		_, err := client.Replicate(ctx, &pb.ReplicateRequest{

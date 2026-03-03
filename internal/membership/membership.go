@@ -93,15 +93,17 @@ func (m *Manager) Activate(nodeID string) error {
 func (m *Manager) MarkDead(nodeID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	var deadAddress string
 	if mem, ok := m.members[nodeID]; ok {
 		mem.Status = pb.MemberStatus_DEAD
+		deadAddress = mem.Address
 	}
 	m.rebuildRingLocked()
 	// Drop cached client so we don't try to dial a dead node.
 	m.clientCacheMu.Lock()
-	if e, ok := m.clientCache[nodeID]; ok {
+	if e, ok := m.clientCache[deadAddress]; ok {
 		_ = e.conn.Close()
-		delete(m.clientCache, nodeID)
+		delete(m.clientCache, deadAddress)
 	}
 	m.clientCacheMu.Unlock()
 }
@@ -184,39 +186,39 @@ func (m *Manager) ClearSuspect(nodeID string) {
 // ─── gRPC client vending ──────────────────────────────────────────────────────
 
 // MembershipClient returns a gRPC MembershipServiceClient for the given address.
-func (m *Manager) MembershipClient(ctx context.Context, address string) (pb.MembershipServiceClient, *grpc.ClientConn, error) {
+func (m *Manager) MembershipClient(ctx context.Context, address string) (pb.MembershipServiceClient, error) {
 	conn, err := m.dial(address)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return pb.NewMembershipServiceClient(conn), conn, nil
+	return pb.NewMembershipServiceClient(conn), nil
 }
 
 // TransferClient returns a gRPC TransferServiceClient for the given address.
-func (m *Manager) TransferClient(ctx context.Context, address string) (pb.TransferServiceClient, *grpc.ClientConn, error) {
+func (m *Manager) TransferClient(ctx context.Context, address string) (pb.TransferServiceClient, error) {
 	conn, err := m.dial(address)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return pb.NewTransferServiceClient(conn), conn, nil
+	return pb.NewTransferServiceClient(conn), nil
 }
 
 // ReplicationClient returns a gRPC ReplicationServiceClient for the given address.
-func (m *Manager) ReplicationClient(ctx context.Context, address string) (pb.ReplicationServiceClient, *grpc.ClientConn, error) {
+func (m *Manager) ReplicationClient(ctx context.Context, address string) (pb.ReplicationServiceClient, error) {
 	conn, err := m.dial(address)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return pb.NewReplicationServiceClient(conn), conn, nil
+	return pb.NewReplicationServiceClient(conn), nil
 }
 
 // DataClient returns a gRPC DataServiceClient for the given address.
-func (m *Manager) DataClient(ctx context.Context, address string) (pb.DataServiceClient, *grpc.ClientConn, error) {
+func (m *Manager) DataClient(ctx context.Context, address string) (pb.DataServiceClient, error) {
 	conn, err := m.dial(address)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return pb.NewDataServiceClient(conn), conn, nil
+	return pb.NewDataServiceClient(conn), nil
 }
 
 // ─── internal ────────────────────────────────────────────────────────────────

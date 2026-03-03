@@ -2,7 +2,9 @@ package storage
 
 import (
 	"database/sql"
+	"encoding/binary"
 	"fmt"
+	"strconv"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -60,7 +62,7 @@ func (s *Store) migrate() error {
 	CREATE TABLE IF NOT EXISTS user_records (
 		username    TEXT    PRIMARY KEY,
 		node_id     TEXT    NOT NULL,
-		ring_pos    INTEGER NOT NULL,   -- hash(username) for range queries
+		ring_pos    BLOB    NOT NULL,   -- big-endian uint64 hash(username)
 		version     INTEGER NOT NULL DEFAULT 0,
 		updated_at  INTEGER NOT NULL    -- unix millis
 	);
@@ -73,8 +75,8 @@ func (s *Store) migrate() error {
 	-- Used to quickly answer "do I own this key?" without querying the ring.
 	CREATE TABLE IF NOT EXISTS owned_ranges (
 		vnode_id    TEXT    PRIMARY KEY,
-		range_start INTEGER NOT NULL,   -- exclusive
-		range_end   INTEGER NOT NULL,   -- inclusive
+		range_start BLOB    NOT NULL,   -- big-endian uint64, exclusive
+		range_end   BLOB    NOT NULL,   -- big-endian uint64, inclusive
 		role        TEXT    NOT NULL    -- 'primary' | 'replica' | 'transferring'
 	);
 	`)
@@ -98,7 +100,7 @@ func (s *Store) Upsert(r UserRecord) (applied bool, err error) {
 			version    = excluded.version,
 			updated_at = excluded.updated_at
 		WHERE excluded.version > user_records.version
-	`, r.Username, r.NodeID, r.RingPos, r.Version, r.UpdatedAt)
+	`, r.Username, r.NodeID, encodeU64(r.RingPos), r.Version, r.UpdatedAt)
 	if err != nil {
 		return false, fmt.Errorf("storage: upsert %s: %w", r.Username, err)
 	}
@@ -109,16 +111,22 @@ func (s *Store) Upsert(r UserRecord) (applied bool, err error) {
 // Get returns a user record by username.
 func (s *Store) Get(username string) (UserRecord, bool, error) {
 	var r UserRecord
+	var ringPosRaw any
 	err := s.db.QueryRow(`
 		SELECT username, node_id, ring_pos, version, updated_at
 		FROM user_records WHERE username = ?
-	`, username).Scan(&r.Username, &r.NodeID, &r.RingPos, &r.Version, &r.UpdatedAt)
+	`, username).Scan(&r.Username, &r.NodeID, &ringPosRaw, &r.Version, &r.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return UserRecord{}, false, nil
 	}
 	if err != nil {
 		return UserRecord{}, false, fmt.Errorf("storage: get %s: %w", username, err)
 	}
+	ringPos, err := decodeU64(ringPosRaw)
+	if err != nil {
+		return UserRecord{}, false, fmt.Errorf("storage: get %s decode ring_pos: %w", username, err)
+	}
+	r.RingPos = ringPos
 	return r, true, nil
 }
 
@@ -140,14 +148,14 @@ func (s *Store) GetRange(start, end uint64) ([]UserRecord, error) {
 			SELECT username, node_id, ring_pos, version, updated_at
 			FROM user_records
 			WHERE ring_pos > ? AND ring_pos <= ?
-		`, start, end)
+		`, encodeU64(start), encodeU64(end))
 	} else {
 		// Wrap-around: (start, maxUint64] ∪ [0, end]
 		rows, err = s.db.Query(`
 			SELECT username, node_id, ring_pos, version, updated_at
 			FROM user_records
 			WHERE ring_pos > ? OR ring_pos <= ?
-		`, start, end)
+		`, encodeU64(start), encodeU64(end))
 	}
 	if err != nil {
 		return nil, fmt.Errorf("storage: getRange (%d,%d]: %w", start, end, err)
@@ -157,9 +165,15 @@ func (s *Store) GetRange(start, end uint64) ([]UserRecord, error) {
 	var records []UserRecord
 	for rows.Next() {
 		var r UserRecord
-		if err := rows.Scan(&r.Username, &r.NodeID, &r.RingPos, &r.Version, &r.UpdatedAt); err != nil {
+		var ringPosRaw any
+		if err := rows.Scan(&r.Username, &r.NodeID, &ringPosRaw, &r.Version, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
+		ringPos, err := decodeU64(ringPosRaw)
+		if err != nil {
+			return nil, fmt.Errorf("storage: getRange decode ring_pos: %w", err)
+		}
+		r.RingPos = ringPos
 		records = append(records, r)
 	}
 	return records, rows.Err()
@@ -171,11 +185,11 @@ func (s *Store) DeleteRange(start, end uint64) error {
 	if start < end {
 		_, err = s.db.Exec(`
 			DELETE FROM user_records WHERE ring_pos > ? AND ring_pos <= ?
-		`, start, end)
+		`, encodeU64(start), encodeU64(end))
 	} else {
 		_, err = s.db.Exec(`
 			DELETE FROM user_records WHERE ring_pos > ? OR ring_pos <= ?
-		`, start, end)
+		`, encodeU64(start), encodeU64(end))
 	}
 	return err
 }
@@ -199,7 +213,7 @@ func (s *Store) SetRange(vnodeID string, start, end uint64, role RangeRole) erro
 			range_start = excluded.range_start,
 			range_end   = excluded.range_end,
 			role        = excluded.role
-	`, vnodeID, start, end, string(role))
+	`, vnodeID, encodeU64(start), encodeU64(end), string(role))
 	return err
 }
 
@@ -223,9 +237,20 @@ func (s *Store) GetOwnedRanges() ([]OwnedRangeRow, error) {
 	for rows.Next() {
 		var o OwnedRangeRow
 		var role string
-		if err := rows.Scan(&o.VnodeID, &o.Start, &o.End, &role); err != nil {
+		var startRaw, endRaw any
+		if err := rows.Scan(&o.VnodeID, &startRaw, &endRaw, &role); err != nil {
 			return nil, err
 		}
+		start, err := decodeU64(startRaw)
+		if err != nil {
+			return nil, fmt.Errorf("storage: getOwnedRanges decode range_start: %w", err)
+		}
+		end, err := decodeU64(endRaw)
+		if err != nil {
+			return nil, fmt.Errorf("storage: getOwnedRanges decode range_end: %w", err)
+		}
+		o.Start = start
+		o.End = end
 		o.Role = RangeRole(role)
 		result = append(result, o)
 	}
@@ -243,4 +268,37 @@ type OwnedRangeRow struct {
 
 func NowMillis() int64 {
 	return time.Now().UnixMilli()
+}
+
+func encodeU64(v uint64) []byte {
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint64(b, v)
+	return b
+}
+
+func decodeU64(raw any) (uint64, error) {
+	switch value := raw.(type) {
+	case int64:
+		if value < 0 {
+			return 0, fmt.Errorf("negative int64 %d cannot decode to uint64", value)
+		}
+		return uint64(value), nil
+	case []byte:
+		if len(value) == 8 {
+			return binary.BigEndian.Uint64(value), nil
+		}
+		asUint, err := strconv.ParseUint(string(value), 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid []byte length %d", len(value))
+		}
+		return asUint, nil
+	case string:
+		asUint, err := strconv.ParseUint(value, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid string %q", value)
+		}
+		return asUint, nil
+	default:
+		return 0, fmt.Errorf("unsupported type %T", raw)
+	}
 }
