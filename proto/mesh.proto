@@ -1,0 +1,185 @@
+syntax = "proto3";
+
+package mesh;
+
+option go_package = "github.com/jackstoller/p2p-messaging/proto/mesh;mesh";
+
+// ─── Shared enums ────────────────────────────────────────────────────────────
+
+// VnodeState tracks whether a virtual node is accepting traffic.
+// Vnodes start INACTIVE and become ACTIVE once a transfer completes.
+enum VnodeState {
+  VNODE_INACTIVE = 0;
+  VNODE_ACTIVE   = 1;
+}
+
+// PeerState is the broadcast state of a physical node.
+// SUSPECT is intentionally absent — it is a local-only transient state.
+enum PeerState {
+  PEER_UP   = 0;
+  PEER_DOWN = 1;
+}
+
+// ─── Shared types ────────────────────────────────────────────────────────────
+
+// VirtualNode is one position on the consistent hash ring.
+message VirtualNode {
+  string     id       = 1; // "nodeID:index", e.g. "node1:0"
+  string     node_id  = 2;
+  uint64     position = 3; // ring position: hash(nodeID:index)
+  string     address  = 4; // gRPC address of the physical node TODO: Remove, redundant
+  VnodeState state    = 5;
+}
+
+// Member describes a known physical node in the mesh.
+message Member {
+  string               node_id = 1;
+  string               address = 2; // gRPC address of the physical node
+  repeated VirtualNode vnodes  = 3;
+  PeerState            state   = 4;
+}
+
+// DataRecord is a stored key/value pair with a timestamp for last-write-wins
+// conflict resolution. The timestamp is set by the primary on write.
+message DataRecord {
+  string key       = 1;
+  bytes  value     = 2;
+  int64  timestamp = 3; // unix millis
+}
+
+// ─── MembershipService ───────────────────────────────────────────────────────
+
+service MembershipService {
+  // New node → bootstrap: "I exist; add me to the mesh." TODO: Is this step necessary?
+  rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
+
+  // New node → bootstrap: "Give me the full member list."
+  rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
+
+  // Any node → all: broadcast that a node came up or went down.
+  rpc NodeStatus(NodeStatusRequest) returns (NodeStatusResponse);
+
+  // Any node → any node: liveness probe.
+  rpc Ping(PingRequest) returns (PingResponse);
+
+  // Any node → peer: "Do you also think this node is unreachable?"
+  rpc ConfirmSuspect(ConfirmSuspectRequest) returns (ConfirmSuspectResponse);
+}
+
+message RegisterNodeRequest  { Member member = 1; }
+message RegisterNodeResponse { bool   accepted = 1; }
+
+message ListNodesRequest     { string requesting_node_id = 1; }
+message ListNodesResponse    { repeated Member members   = 1; }
+
+// NodeStatusRequest carries a PEER_UP announcement (with vnodes) or a
+// PEER_DOWN declaration (vnodes omitted).
+message NodeStatusRequest {
+  string               node_id = 1;
+  PeerState            state   = 2;
+  repeated VirtualNode vnodes  = 3; // TODO: make optional?
+}
+message NodeStatusResponse {}
+
+message PingRequest  { string node_id = 1; } // TODO: add timestamps for latency
+message PingResponse { string node_id = 1; }
+
+message ConfirmSuspectRequest  { string suspect_node_id = 1; }
+message ConfirmSuspectResponse { bool   confirmed       = 1; }
+
+// ─── TransferService ─────────────────────────────────────────────────────────
+// Handles data handoff when a new node claims a virtual node. (Phase 2)
+
+service TransferService {
+  // Joiner → current owner: "I claim this vnode; begin handoff."
+  rpc RequestTransfer(RequestTransferRequest) returns (RequestTransferResponse);
+
+  // Owner → joiner: stream all records in the vnode's range.
+  rpc StreamSlice(StreamSliceRequest) returns (stream DataChunk);
+
+  // Owner → joiner: forward a live write that arrived during the transfer window.
+  rpc ForwardWrite(ForwardWriteRequest) returns (ForwardWriteResponse);
+
+  // Joiner → owner: "I have all data; hand over primary authority."
+  rpc CompleteTransfer(CompleteTransferRequest) returns (CompleteTransferResponse);
+
+  // New owner → all: this vnode is now ACTIVE under new ownership.
+  rpc VnodeStatusUpdate(VnodeStatusUpdateRequest) returns (VnodeStatusUpdateResponse);
+}
+
+message RequestTransferRequest {
+  string vnode_id  = 1;
+  string requestor = 2;
+}
+message RequestTransferResponse { bool accepted = 1; }
+
+message StreamSliceRequest { string vnode_id = 1; }
+message DataChunk {
+  string              vnode_id = 1;
+  int32               seq      = 2;
+  bool                final    = 3;
+  repeated DataRecord records  = 4;
+}
+
+message ForwardWriteRequest {
+  string     write_id = 1;
+  DataRecord record   = 2;
+}
+message ForwardWriteResponse { string write_id = 1; }
+
+message CompleteTransferRequest  { string vnode_id = 1; }
+message CompleteTransferResponse { bool   accepted = 1; }
+
+message VnodeStatusUpdateRequest {
+  string     vnode_id = 1;
+  string     owner_id = 2;
+  VnodeState state    = 3;
+}
+message VnodeStatusUpdateResponse {}
+
+// ─── ReplicaService ──────────────────────────────────────────────────────────
+// Handles replication and replica repair after topology changes. (Phase 3)
+
+service ReplicaService {
+  // Primary → replica: update rank and primary identity.
+  rpc UpdateReplicaRank(UpdateReplicaRankRequest) returns (UpdateReplicaRankResponse);
+
+  // Primary → new replica: store this record.
+  rpc CreateReplica(CreateReplicaRequest) returns (CreateReplicaResponse);
+}
+
+message UpdateReplicaRankRequest {
+  string vnode_id   = 1;
+  string primary_id = 2;
+  int32  new_rank   = 3;
+}
+message UpdateReplicaRankResponse {}
+
+message CreateReplicaRequest {
+  string     vnode_id = 1;
+  DataRecord record   = 2;
+}
+message CreateReplicaResponse { bool ack = 1; }
+
+// ─── DataService ─────────────────────────────────────────────────────────────
+// External-facing read/write interface routed to the primary. (Phase 3)
+
+service DataService {
+  rpc Write(WriteRequest) returns (WriteResponse);
+  rpc Read(ReadRequest)   returns (ReadResponse);
+}
+
+message WriteRequest {
+  string key   = 1;
+  bytes  value = 2;
+}
+message WriteResponse {
+  bool  ok        = 1;
+  int64 timestamp = 2;
+}
+
+message ReadRequest  { string key = 1; }
+message ReadResponse {
+  bytes value = 1;
+  bool  found = 2;
+}

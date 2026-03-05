@@ -1,0 +1,131 @@
+## Protocols
+
+### Join Flow
+
+`Local`: The node joining the mesh.
+`Remote`: The node the `Local` first contacts to join the mesh.
+
+1. The `Local` initializes itself, creating it's virtual nodes and it's own internal ring.
+
+2. The `Local` sends a `JoinMesh` request to the `Remote`.
+> Note: If `Remote` is reachable `Local` should retry before eventually switching to another known node address if available.
+
+3. The `Remote` response with it's current list of all nodes within the mesh, including their virtual nodes. The `Local` adds these nodes to their own internal ring.
+
+4. The `Local` broadcasts a `NodeStatus` message to other nodes which includes all of it's virtual node ranges, marked as `INACTIVE`.
+
+5. `Local` is now on the mesh and enters the `Heartbeat Flow`, but does not have any active ranges.
+
+6. `Local` identifies ranges to takeover ownership. For each range, it enters the `Range Transfer Flow`
+
+
+### Heartbeat Flow
+
+> Note: this flow automatically restarts on an interval like 5 seconds.
+
+1. Sends a `Ping` message to every node in the mesh, expecting a response
+
+2. If the `Ping` message was successful, the flow exits.
+
+> Note: Beyond this point, if the node receives a `NodeStatus` `DOWN` message in regards to the current suspect node, the process is stopped early.
+
+3. If the `Ping` message failed, the node is internally marked as suspect and message is retried 3 times with a 3 second delay. Any successful responses exit and reset state
+
+4. Up to 5 other nodes on the mesh are chosen that are not current suspects.
+
+5. Each node is send a `ConfirmSuspect` message. This message should resolve immediately based on each node's internal suspect flag. Unresponsive nodes are replaced and then excluded
+
+6. If above 50% (not equal) of nodes confirm, this node will broadcast a `NodeStatus` `DOWN` message. On meshes consisting of 3 nodes or smaller, the nodes own failures are enough to continue
+
+> Note: Nodes could possibly receive multiple `NodeStatus` `DOWN` messages. This does not matter and only the first is processed.
+
+7. Upon receiving, or learning internally, that a node is down, the appropriate ranges are marked as `INACTIVE`, possibly triggering the `Replica Take Over Flow`.
+
+
+### Range Transfer Flow
+
+`Local`: The node initiating the transfer of the range to itself.
+`Remote`: The node who initially holds the range.
+
+1. `Local` sends a `RangeTransferRequest` to `Remote`, `Remote` accepts unless the range is already being transferred or if the `Remote` range is still in `INACTIVE`
+
+2. If the `RangeTransferRequest` is denied, `Local` waits with an exponential backoff up to 30 minutes. `Remote` will be recomputed each time.
+
+3. `Remote` marks the range internally as transferring, refusing all other transfer requests and begins to buffer all write requests to that range, but does not stop applying them locally. Read requests are not changed.
+
+4. `Remote` begins to stream the range data to `Local`
+
+5. When all data is transferred, `Remote` begins to send the buffered write requests and continues to send write requests as they are received (and still applied locally)
+
+6. `Local` begins to request control by sending a `RangeTransferComplete` message. `Remote` will not accept until it's write buffer is emptied and all write requests have been acknowledged by `Local`. `Remote` will wait up to 5s before rejecting a request. `Local` will retry up to 5 times.
+
+7. Once `Remote` has accepted the message it rejects all write messages while still accepting reads. `Remote` still acts as the primary.
+
+8. Once `Local` receives the accepted message, it marks the ranges internally as `ACTIVE` and then broadcasts a `RangeStatusUpdate` message to all nodes in the mesh.
+
+9. Once `Remote` has received this broadcast it no longer acts as the primary. `Remote` will drop data in this range.
+
+> Note: There is a chance writes sent between 6 and 7 are rejected. As this is a quick change, all nodes making write requests are expected to include some level of retry which would resolve this.
+
+> Note: If `Local` goes offline (via `Heartbeat Flow`) during steps 1-7, `Remote` clears the hold on the range, empties buffer and accepts all messages again, acting fully as the primary.
+
+> Note: If `Remote` goes offline (via `Heartbeat Flow`) during steps 1-7, `Local` goes to step 2 and will transfer from the newly active primary.
+
+
+### Replica Update Flow
+
+1. A node identifies a change in the nodes storing it (via a `NodeStatus` `DOWN`) in any of the following cases:
+
+    a. The primary controller identifies a lost replica
+    b. The first replica identifies lost primary
+    c. The primary identifies a change in ranges that either allow for another replica to be created, or conflict the replica order (new range in the middle)
+
+    > This trigger occurs when ranges become ACTIVE. INACTIVE ranges are ignored.
+
+2. If it is replica, it internally promotes the replica to primary.
+
+3. Sends `UpdateReplicaRank` messages to the existing replicas to update their rank.
+
+4. Identities 1 additional replica node and places a new replica there
+
+> Note: this process may be skipped if the mesh size is constraining
+
+
+### Write Flow
+
+`Key`: The string value used to store the data on the mesh
+`Value`: The string value associated with the key, opaque
+`Timestamp`: Time the request was received. Used to resolve conflicts.
+
+1. The `Key` is hashed. The primary virtual node is determined clockwise.
+
+2. A `Write` message is sent to the node containing the virtual node. This is skipped if it is internal.
+> Note: This process should retry on failure as there are valid cases for momentary failure during a range transfer.
+
+3. The node receives the `Write` message and writes internally, responds to the client before continuing async.
+
+4. The necessary replicas are identified
+
+5. A `CreateReplica` message is sent to each node, expecting an ACK. Retries on failure, logging a critical message if retries fail
+
+
+### Read Flow
+
+`Key`: The string value used to retrieve the data on the mesh
+
+1. The `Key` is hashed. The primary virtual node is determined clockwise.
+
+2. A `Read` message is sent to the node containing the virtual node.
+
+3. If the node is unreachable it is retried once, then replicas are tried before failing.
+
+4. The node locates the `Key` in it's storage, returns a not found if nothing is there.
+
+
+## Data Storage
+
+The primary copy of the data is stored a the closest clockwise virtual node, wrapping around. For example, assume a space of 100, virtual nodes a 30 and 70. A value of 20 would be stored on 30, 40 on 70, 90 on 30, etc.
+
+The number of replicas is configurable, but can not exceed the number of nodes on the mesh (in that case a full replication will just not be completed).
+
+The storage of location replicas is always just the next virtual node, excluding any nodes that are already used for storage of the primary or other higher replicas. Replicas are ordered so there is a coordinated response when promoting.

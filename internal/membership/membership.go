@@ -3,304 +3,566 @@ package membership
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
+	pb "github.com/jackstoller/p2p-messaging/proto/mesh"
 	"github.com/jackstoller/p2p-messaging/internal/ring"
-	pb "github.com/jackstoller/p2p-messaging/proto/node"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
 
-// Member represents a known node in the network.
-type Member struct {
+// ─── Types ───────────────────────────────────────────────────────────────────
+
+// VnodeState mirrors the proto enum but lives in the membership layer to
+// decouple internal state from the wire format.
+type VnodeState int
+
+const (
+	VnodeInactive VnodeState = iota
+	VnodeActive
+)
+
+// PeerState is the broadcast state of a physical node; SUSPECT is local-only
+// and is tracked separately in the suspects set.
+type PeerState int
+
+const (
+	PeerUp PeerState = iota
+	PeerDown
+)
+
+// Vnode is one virtual-node position belonging to a physical node.
+type Vnode struct {
+	ID       string // "nodeID:index"
+	Position uint64
+	State    VnodeState
+}
+
+// Peer is a known physical node in the mesh.
+type Peer struct {
 	NodeID  string
 	Address string
-	Vnodes  []VirtualNode
-	Status  pb.MemberStatus
+	Vnodes  []Vnode
+	State   PeerState
 }
 
-// VirtualNode is one ring position owned by a physical node.
-type VirtualNode struct {
-	Position uint64
-	NodeID   string
-	Address  string
-}
+// ─── Manager ─────────────────────────────────────────────────────────────────
 
-// Manager owns the member list and the ring, and vends gRPC clients
-// to peer nodes. It is the single source of truth for "who is alive."
+// Manager owns the member list, routing ring, and gRPC client cache.
+// It is the single source of truth for mesh topology.
 type Manager struct {
 	mu      sync.RWMutex
-	self    Member
-	members map[string]*Member // keyed by NodeID
-	Ring    *ring.Ring
+	selfID  string
+	self    Peer
+	members map[string]*Peer // nodeID → peer, includes self
 
-	tlsCfg        *tls.Config // mTLS config for outbound connections
-	replicaCount  int
-	clientCache   map[string]*clientEntry
-	clientCacheMu sync.Mutex
+	Ring *ring.Ring
 
-	// Suspect tracking: nodeID → set of reporter IDs
-	suspects   map[string]map[string]struct{}
+	// suspects tracks nodes this instance has locally failed to ping.
+	// Suspect state is never broadcast; only UP/DOWN are shared.
 	suspectsMu sync.Mutex
+	suspects   map[string]struct{}
+
+	replicaCount int
+	tlsCfg       *tls.Config
+
+	clientsMu sync.Mutex
+	clients   map[string]*cachedConn
+
+	// OnPeerDown is called (in a goroutine) when a peer is confirmed dead.
+	// Wire this up in main for Phase 2/3 handlers.
+	OnPeerDown func(nodeID string)
 }
 
-type clientEntry struct {
+type cachedConn struct {
 	conn   *grpc.ClientConn
 	expiry time.Time
 }
 
-// New creates a Manager for this node.
-func New(self Member, replicaCount int, tlsCfg *tls.Config) *Manager {
+const connTTL = 5 * time.Minute
+
+// NewManager creates a Manager for this node. The node starts with all its own
+// vnodes INACTIVE; call ActivateSelf() if this is the first node in the network,
+// or let the transfer flow activate them as ranges are claimed.
+func NewManager(nodeID, address string, replicaCount int, tlsCfg *tls.Config) *Manager {
+	self := buildSelf(nodeID, address)
 	m := &Manager{
+		selfID:       nodeID,
 		self:         self,
-		members:      map[string]*Member{self.NodeID: &self},
+		members:      map[string]*Peer{nodeID: &self},
 		Ring:         ring.New(),
-		tlsCfg:       tlsCfg,
+		suspects:     map[string]struct{}{},
 		replicaCount: replicaCount,
-		clientCache:  map[string]*clientEntry{},
-		suspects:     map[string]map[string]struct{}{},
+		tlsCfg:       tlsCfg,
+		clients:      map[string]*cachedConn{},
 	}
 	return m
 }
 
-// ─── member list mutations ────────────────────────────────────────────────────
-
-// AddPending adds a node as PENDING (excluded from routing ring).
-func (m *Manager) AddPending(member Member) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	member.Status = pb.MemberStatus_PENDING
-	m.members[member.NodeID] = &member
-	// Ring NOT rebuilt — pending nodes invisible to routing.
+// buildSelf constructs this node's Peer descriptor. Virtual node positions
+// are derived deterministically from nodeID so they survive restarts.
+func buildSelf(nodeID, address string) Peer {
+	vnodes := make([]Vnode, ring.DefaultVnodeCount)
+	for i := range vnodes {
+		vnodes[i] = Vnode{
+			ID:       ring.VnodeID(nodeID, i),
+			Position: ring.VnodePosition(nodeID, i),
+			State:    VnodeInactive,
+		}
+	}
+	return Peer{
+		NodeID:  nodeID,
+		Address: address,
+		Vnodes:  vnodes,
+		State:   PeerUp,
+	}
 }
 
-// Activate marks a node ACTIVE and rebuilds the ring.
-func (m *Manager) Activate(nodeID string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	mem, ok := m.members[nodeID]
-	if !ok {
-		return fmt.Errorf("membership: activate unknown node %s", nodeID)
+// ─── Join flow ────────────────────────────────────────────────────────────────
+
+// Join runs steps 1–3 of the join flow:
+//  1. Register with any reachable bootstrap peer.
+//  2. Fetch the full member list from that bootstrap and rebuild the ring.
+//  3. Announce presence (UP, all vnodes INACTIVE) to all known peers.
+func (m *Manager) Join(ctx context.Context, bootstrapPeers []string) error {
+	// Step 1: Register — try each bootstrap address until one accepts.
+	bootstrapAddr, err := m.registerWithBootstrap(ctx, bootstrapPeers)
+	if err != nil {
+		return err
 	}
-	mem.Status = pb.MemberStatus_ACTIVE
-	m.rebuildRingLocked()
+
+	// Step 2: Fetch full member list and build the ring.
+	if err := m.syncMembersFrom(ctx, bootstrapAddr); err != nil {
+		return err
+	}
+
+	// Step 3: Announce self (UP, all vnodes INACTIVE) to all known peers.
+	m.broadcastStatus(ctx, pb.PeerState_PEER_UP)
+
+	slog.Info("joined mesh", "nodeID", m.selfID, "peers", len(m.ActivePeers()))
 	return nil
 }
 
-// MarkDead removes a node from the active ring and marks it DEAD.
-func (m *Manager) MarkDead(nodeID string) {
+func (m *Manager) registerWithBootstrap(ctx context.Context, peers []string) (string, error) {
+	req := &pb.RegisterNodeRequest{Member: m.SelfProto()}
+	for _, addr := range peers {
+		client, err := m.MembershipClient(ctx, addr)
+		if err != nil {
+			slog.Warn("bootstrap unreachable", "addr", addr, "err", err)
+			continue
+		}
+		resp, err := client.RegisterNode(ctx, req)
+		if err != nil {
+			slog.Warn("RegisterNode failed", "addr", addr, "err", err)
+			continue
+		}
+		if !resp.Accepted {
+			slog.Warn("RegisterNode rejected", "addr", addr)
+			continue
+		}
+		slog.Info("registered with bootstrap", "addr", addr)
+		return addr, nil
+	}
+	return "", errors.New("membership: no bootstrap peer accepted registration")
+}
+
+func (m *Manager) syncMembersFrom(ctx context.Context, addr string) error {
+	client, err := m.MembershipClient(ctx, addr)
+	if err != nil {
+		return fmt.Errorf("membership: dial bootstrap for sync: %w", err)
+	}
+	resp, err := client.ListNodes(ctx, &pb.ListNodesRequest{RequestingNodeId: m.selfID})
+	if err != nil {
+		return fmt.Errorf("membership: ListNodes from %s: %w", addr, err)
+	}
+
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	var deadAddress string
-	if mem, ok := m.members[nodeID]; ok {
-		mem.Status = pb.MemberStatus_DEAD
-		deadAddress = mem.Address
+	for _, pm := range resp.Members {
+		if pm.NodeId == m.selfID {
+			continue // skip self to avoid overwriting our own state
+		}
+		peer := protoToPeer(pm)
+		m.members[peer.NodeID] = &peer
 	}
 	m.rebuildRingLocked()
-	// Drop cached client so we don't try to dial a dead node.
-	m.clientCacheMu.Lock()
-	if e, ok := m.clientCache[deadAddress]; ok {
-		_ = e.conn.Close()
-		delete(m.clientCache, deadAddress)
-	}
-	m.clientCacheMu.Unlock()
+	m.mu.Unlock()
+
+	slog.Info("synced member list", "from", addr, "count", len(resp.Members))
+	return nil
 }
 
-// ApplySnapshot replaces the member list from a SyncMembers response.
-// Used on first join before this node has any peers.
-func (m *Manager) ApplySnapshot(members []*pb.Member) {
+// broadcastStatus sends a NodeStatus RPC to all known UP peers (fire-and-forget).
+// For PEER_UP the announcement includes all own vnodes (marked INACTIVE).
+func (m *Manager) broadcastStatus(ctx context.Context, state pb.PeerState) {
+	req := &pb.NodeStatusRequest{
+		NodeId: m.selfID,
+		State:  state,
+	}
+	if state == pb.PeerState_PEER_UP {
+		req.Vnodes = m.selfVnodesProto()
+	}
+
+	for _, peer := range m.upPeers() {
+		go func(p Peer) {
+			broadcastCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			client, err := m.MembershipClient(broadcastCtx, p.Address)
+			if err != nil {
+				return
+			}
+			if _, err = client.NodeStatus(broadcastCtx, req); err != nil {
+				slog.Debug("NodeStatus broadcast failed", "to", p.NodeID, "err", err)
+			}
+		}(peer)
+	}
+}
+
+// ─── State: self ─────────────────────────────────────────────────────────────
+
+// ActivateSelf activates all own vnodes immediately. Used by the first node in
+// the network, which has no predecessor to transfer ranges from.
+func (m *Manager) ActivateSelf_NEVER_CALL() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	// Keep self.
-	m.members = map[string]*Member{m.self.NodeID: &m.self}
-	for _, pm := range members {
-		mem := protoToMember(pm)
-		m.members[mem.NodeID] = &mem
+	peer := m.members[m.selfID]
+	for i := range peer.Vnodes {
+		peer.Vnodes[i].State = VnodeActive
 	}
 	m.rebuildRingLocked()
+	slog.Info("self-activated all vnodes", "nodeID", m.selfID, "vnodes", len(peer.Vnodes))
 }
 
-// Self returns this node's member descriptor.
-func (m *Manager) Self() Member {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.self
-}
-
-// ActiveMembers returns all ACTIVE members excluding self.
-func (m *Manager) ActiveMembers() []Member {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	var result []Member
-	for _, mem := range m.members {
-		if mem.NodeID != m.self.NodeID && mem.Status == pb.MemberStatus_ACTIVE {
-			result = append(result, *mem)
+// ActivateVnode marks a single vnode ACTIVE and rebuilds the ring.
+// Called by the server handler when a VnodeStatusUpdate(ACTIVE) is received.
+func (m *Manager) ActivateVnode(nodeID, vnodeID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	peer, ok := m.members[nodeID]
+	if !ok {
+		return
+	}
+	for i := range peer.Vnodes {
+		if peer.Vnodes[i].ID == vnodeID {
+			peer.Vnodes[i].State = VnodeActive
+			break
 		}
 	}
-	return result
+	m.rebuildRingLocked()
 }
 
-// AllMembers returns all known members (any status) including self.
-func (m *Manager) AllMembers() []Member {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	result := make([]Member, 0, len(m.members))
-	for _, mem := range m.members {
-		result = append(result, *mem)
+// ─── State: peers ─────────────────────────────────────────────────────────────
+
+// AddOrUpdatePeer upserts a peer into the member list and rebuilds the ring.
+// Called by the server when a NodeStatus(UP) is received.
+func (m *Manager) AddOrUpdatePeer(nodeID, address string, vnodes []Vnode) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if nodeID == m.selfID {
+		return
 	}
-	return result
+	existing, ok := m.members[nodeID]
+	if ok {
+		// Update address and vnodes; preserve any ACTIVE vnode states we
+		// already know about (the remote might send INACTIVE in the initial
+		// announcement but we may have since learned they're active).
+		// QUESTION: I think this should always overwrite right???
+		existing.Address = address
+		existing.Vnodes = mergeVnodes(existing.Vnodes, vnodes)
+		existing.State = PeerUp
+	} else {
+		m.members[nodeID] = &Peer{
+			NodeID:  nodeID,
+			Address: address,
+			Vnodes:  vnodes,
+			State:   PeerUp,
+		}
+	}
+	m.rebuildRingLocked()
+	slog.Info("peer added/updated", "nodeID", nodeID)
 }
 
-// ReplicaCount returns the configured replication factor.
-func (m *Manager) ReplicaCount() int {
-	return m.replicaCount
+// MarkDown marks a peer as dead, removes it from the routing ring, evicts its
+// cached gRPC connection, and fires OnPeerDown if wired.
+// Called both internally (via the heartbeat flow) and by the server handler
+// when a NodeStatus(DOWN) is received. Safe to call multiple times.
+func (m *Manager) MarkDown(nodeID string) {
+	m.mu.Lock()
+	peer, ok := m.members[nodeID]
+	if !ok || peer.State == PeerDown {
+		m.mu.Unlock()
+		return
+	}
+	peer.State = PeerDown
+	deadAddr := peer.Address
+	m.rebuildRingLocked()
+	m.mu.Unlock()
+
+	// Evict the cached connection so we don't keep dialling a dead node.
+	m.clientsMu.Lock()
+	if c, ok := m.clients[deadAddr]; ok {
+		_ = c.conn.Close()
+		delete(m.clients, deadAddr)
+	}
+	m.clientsMu.Unlock()
+
+	m.ClearSuspect(nodeID)
+	slog.Warn("peer marked dead", "nodeID", nodeID)
+
+	if m.OnPeerDown != nil {
+		go m.OnPeerDown(nodeID)
+	}
 }
 
-// ─── suspect / dead tracking ─────────────────────────────────────────────────
-
-// RecordSuspect notes that reporterID suspects nodeID. Returns true when
-// quorum is reached and the node should be confirmed dead.
-func (m *Manager) RecordSuspect(nodeID, reporterID string) (quorum bool) {
+// MarkSuspect flags a peer as locally suspected. Does not affect routing.
+func (m *Manager) MarkSuspect(nodeID string) {
 	m.suspectsMu.Lock()
-	defer m.suspectsMu.Unlock()
-
-	if _, ok := m.suspects[nodeID]; !ok {
-		m.suspects[nodeID] = map[string]struct{}{}
-	}
-	m.suspects[nodeID][reporterID] = struct{}{}
-
-	active := m.activeCountLocked()
-	threshold := (active / 2) + 1 // simple majority
-	return len(m.suspects[nodeID]) >= threshold
+	m.suspects[nodeID] = struct{}{}
+	m.suspectsMu.Unlock()
 }
 
-// ClearSuspect removes suspicion records for a node (it came back).
+// ClearSuspect removes the suspect flag for a peer.
 func (m *Manager) ClearSuspect(nodeID string) {
 	m.suspectsMu.Lock()
 	delete(m.suspects, nodeID)
 	m.suspectsMu.Unlock()
 }
 
-// ─── gRPC client vending ──────────────────────────────────────────────────────
+// IsDown reports whether a peer has been confirmed dead.
+func (m *Manager) IsDown(nodeID string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	peer, ok := m.members[nodeID]
+	return ok && peer.State == PeerDown
+}
 
-// MembershipClient returns a gRPC MembershipServiceClient for the given address.
-func (m *Manager) MembershipClient(ctx context.Context, address string) (pb.MembershipServiceClient, error) {
-	conn, err := m.dial(address)
+// IsSuspect reports whether this node has locally flagged a peer as suspect.
+func (m *Manager) IsSuspect(nodeID string) bool {
+	m.suspectsMu.Lock()
+	defer m.suspectsMu.Unlock()
+	_, ok := m.suspects[nodeID]
+	return ok
+}
+
+// ─── Queries ─────────────────────────────────────────────────────────────────
+
+// Self returns this node's Peer descriptor.
+func (m *Manager) Self() Peer {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return *m.members[m.selfID]
+}
+
+// SelfProto converts self to the proto wire type.
+func (m *Manager) SelfProto() *pb.Member {
+	return peerToProto(m.Self())
+}
+
+// ActivePeers returns UP, non-suspect peers excluding self. Used by the
+// heartbeat loop as the set of nodes to ping this tick.
+func (m *Manager) ActivePeers() []Peer {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	m.suspectsMu.Lock()
+	defer m.suspectsMu.Unlock()
+
+	var result []Peer
+	for _, p := range m.members {
+		if p.NodeID == m.selfID || p.State == PeerDown {
+			continue
+		}
+		if _, suspect := m.suspects[p.NodeID]; suspect {
+			continue
+		}
+		result = append(result, *p)
+	}
+	return result
+}
+
+// AllMembers returns every known peer regardless of state, including self.
+func (m *Manager) AllMembers() []Peer {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	result := make([]Peer, 0, len(m.members))
+	for _, p := range m.members {
+		result = append(result, *p)
+	}
+	return result
+}
+
+// ReplicaCount returns the configured replication factor.
+func (m *Manager) ReplicaCount() int { return m.replicaCount }
+
+// upPeers returns all UP peers excluding self. Holds no locks; intended for
+// internal use where the lock situation is already managed.
+func (m *Manager) upPeers() []Peer {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var result []Peer
+	for _, p := range m.members {
+		if p.NodeID != m.selfID && p.State == PeerUp {
+			result = append(result, *p)
+		}
+	}
+	return result
+}
+
+// ─── Ring ────────────────────────────────────────────────────────────────────
+
+// rebuildRingLocked rebuilds the routing ring from all ACTIVE vnodes across
+// all UP peers (including self). Caller must hold m.mu.
+func (m *Manager) rebuildRingLocked() {
+	var entries []ring.VnodeEntry
+	for _, peer := range m.members {
+		if peer.State == PeerDown {
+			continue
+		}
+		for _, vn := range peer.Vnodes {
+			if vn.State == VnodeActive {
+				entries = append(entries, ring.VnodeEntry{
+					Position: vn.Position,
+					NodeID:   peer.NodeID,
+					Address:  peer.Address,
+				})
+			}
+		}
+	}
+	m.Ring.Rebuild(entries)
+}
+
+// ─── gRPC client vending ─────────────────────────────────────────────────────
+
+func (m *Manager) MembershipClient(ctx context.Context, addr string) (pb.MembershipServiceClient, error) {
+	conn, err := m.dial(addr)
 	if err != nil {
 		return nil, err
 	}
 	return pb.NewMembershipServiceClient(conn), nil
 }
 
-// TransferClient returns a gRPC TransferServiceClient for the given address.
-func (m *Manager) TransferClient(ctx context.Context, address string) (pb.TransferServiceClient, error) {
-	conn, err := m.dial(address)
+func (m *Manager) TransferClient(ctx context.Context, addr string) (pb.TransferServiceClient, error) {
+	conn, err := m.dial(addr)
 	if err != nil {
 		return nil, err
 	}
 	return pb.NewTransferServiceClient(conn), nil
 }
 
-// ReplicationClient returns a gRPC ReplicationServiceClient for the given address.
-func (m *Manager) ReplicationClient(ctx context.Context, address string) (pb.ReplicationServiceClient, error) {
-	conn, err := m.dial(address)
+func (m *Manager) ReplicaClient(ctx context.Context, addr string) (pb.ReplicaServiceClient, error) {
+	conn, err := m.dial(addr)
 	if err != nil {
 		return nil, err
 	}
-	return pb.NewReplicationServiceClient(conn), nil
+	return pb.NewReplicaServiceClient(conn), nil
 }
 
-// DataClient returns a gRPC DataServiceClient for the given address.
-func (m *Manager) DataClient(ctx context.Context, address string) (pb.DataServiceClient, error) {
-	conn, err := m.dial(address)
+func (m *Manager) DataClient(ctx context.Context, addr string) (pb.DataServiceClient, error) {
+	conn, err := m.dial(addr)
 	if err != nil {
 		return nil, err
 	}
 	return pb.NewDataServiceClient(conn), nil
 }
 
-// ─── internal ────────────────────────────────────────────────────────────────
+func (m *Manager) dial(addr string) (*grpc.ClientConn, error) {
+	m.clientsMu.Lock()
+	defer m.clientsMu.Unlock()
 
-func (m *Manager) dial(address string) (*grpc.ClientConn, error) {
-	m.clientCacheMu.Lock()
-	defer m.clientCacheMu.Unlock()
-
-	if e, ok := m.clientCache[address]; ok && time.Now().Before(e.expiry) {
-		return e.conn, nil
+	if c, ok := m.clients[addr]; ok && time.Now().Before(c.expiry) {
+		return c.conn, nil
 	}
 
-	creds := credentials.NewTLS(m.tlsCfg)
-	conn, err := grpc.NewClient(address, grpc.WithTransportCredentials(creds))
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(credentials.NewTLS(m.tlsCfg)))
 	if err != nil {
-		return nil, fmt.Errorf("membership: dial %s: %w", address, err)
+		return nil, fmt.Errorf("membership: dial %s: %w", addr, err)
 	}
-	m.clientCache[address] = &clientEntry{
-		conn:   conn,
-		expiry: time.Now().Add(5 * time.Minute),
-	}
+	m.clients[addr] = &cachedConn{conn: conn, expiry: time.Now().Add(connTTL)}
 	return conn, nil
 }
 
-func (m *Manager) rebuildRingLocked() {
-	entries := make([]ring.NodeEntry, 0, len(m.members))
-	for _, mem := range m.members {
-		if mem.Status != pb.MemberStatus_ACTIVE {
-			continue
-		}
-		entries = append(entries, ring.NodeEntry{
-			NodeID:  mem.NodeID,
-			Address: mem.Address,
-			Vnodes:  len(mem.Vnodes),
-		})
-	}
-	m.Ring.Rebuild(entries)
-}
+// ─── Proto conversion ─────────────────────────────────────────────────────────
 
-func (m *Manager) activeCountLocked() int {
-	// Called from suspect tracking — doesn't hold m.mu, keep it that way.
+func (m *Manager) selfVnodesProto() []*pb.VirtualNode {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	count := 0
-	for _, mem := range m.members {
-		if mem.Status == pb.MemberStatus_ACTIVE {
-			count++
-		}
-	}
-	return count
+	self := m.members[m.selfID]
+	return vnodesProto(self.NodeID, self.Address, self.Vnodes)
 }
 
-// ─── proto conversion helpers ─────────────────────────────────────────────────
-
-func protoToMember(pm *pb.Member) Member {
-	mem := Member{
+func protoToPeer(pm *pb.Member) Peer {
+	vnodes := make([]Vnode, 0, len(pm.Vnodes))
+	for _, pv := range pm.Vnodes {
+		state := VnodeInactive
+		if pv.State == pb.VnodeState_VNODE_ACTIVE {
+			state = VnodeActive
+		}
+		vnodes = append(vnodes, Vnode{
+			ID:       pv.Id,
+			Position: pv.Position,
+			State:    state,
+		})
+	}
+	state := PeerUp
+	if pm.State == pb.PeerState_PEER_DOWN {
+		state = PeerDown
+	}
+	return Peer{
 		NodeID:  pm.NodeId,
 		Address: pm.Address,
-		Status:  pm.Status,
+		Vnodes:  vnodes,
+		State:   state,
 	}
-	for _, vn := range pm.Vnodes {
-		mem.Vnodes = append(mem.Vnodes, VirtualNode{
-			Position: vn.Position,
-			NodeID:   vn.NodeId,
-			Address:  vn.Address,
-		})
-	}
-	return mem
 }
 
-func MemberToProto(mem Member) *pb.Member {
-	pm := &pb.Member{
-		NodeId:  mem.NodeID,
-		Address: mem.Address,
-		Status:  mem.Status,
+func peerToProto(p Peer) *pb.Member {
+	state := pb.PeerState_PEER_UP
+	if p.State == PeerDown {
+		state = pb.PeerState_PEER_DOWN
 	}
-	for _, vn := range mem.Vnodes {
-		pm.Vnodes = append(pm.Vnodes, &pb.VirtualNode{
-			NodeId:   vn.NodeID,
+	return &pb.Member{
+		NodeId:  p.NodeID,
+		Address: p.Address,
+		Vnodes:  vnodesProto(p.NodeID, p.Address, p.Vnodes),
+		State:   state,
+	}
+}
+
+func vnodesProto(nodeID, address string, vnodes []Vnode) []*pb.VirtualNode {
+	result := make([]*pb.VirtualNode, len(vnodes))
+	for i, vn := range vnodes {
+		state := pb.VnodeState_VNODE_INACTIVE
+		if vn.State == VnodeActive {
+			state = pb.VnodeState_VNODE_ACTIVE
+		}
+		result[i] = &pb.VirtualNode{
+			Id:       vn.ID,
+			NodeId:   nodeID,
 			Position: vn.Position,
-			Address:  vn.Address,
-		})
+			Address:  address,
+			State:    state,
+		}
 	}
-	return pm
+	return result
+}
+
+// mergeVnodes updates the existing vnode list with incoming states, preserving
+// any ACTIVE state we already know about (incoming may send INACTIVE for a vnode
+// we've already seen go ACTIVE via VnodeStatusUpdate).
+// TODO: I think we should be eliminating this
+func mergeVnodes(existing, incoming []Vnode) []Vnode {
+	existingByID := make(map[string]VnodeState, len(existing))
+	for _, vn := range existing {
+		existingByID[vn.ID] = vn.State
+	}
+	merged := make([]Vnode, len(incoming))
+	for i, vn := range incoming {
+		if existing, ok := existingByID[vn.ID]; ok && existing == VnodeActive {
+			vn.State = VnodeActive // don't downgrade
+		}
+		merged[i] = vn
+	}
+	return merged
 }
