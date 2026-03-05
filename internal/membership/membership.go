@@ -9,8 +9,9 @@ import (
 	"sync"
 	"time"
 
-	pb "github.com/jackstoller/p2p-messaging/proto/mesh"
 	"github.com/jackstoller/p2p-messaging/internal/ring"
+	"github.com/jackstoller/p2p-messaging/internal/util"
+	pb "github.com/jackstoller/p2p-messaging/proto/mesh"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
@@ -48,6 +49,11 @@ type Peer struct {
 	Address string
 	Vnodes  []Vnode
 	State   PeerState
+}
+
+// GetNodeID returns the node ID of this peer (implements BroadcastPeer interface).
+func (p Peer) GetNodeID() string {
+	return p.NodeID
 }
 
 // ─── Manager ─────────────────────────────────────────────────────────────────
@@ -206,19 +212,15 @@ func (m *Manager) broadcastStatus(ctx context.Context, state pb.PeerState) {
 		req.Vnodes = m.selfVnodesProto()
 	}
 
-	for _, peer := range m.upPeers() {
-		go func(p Peer) {
-			broadcastCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			defer cancel()
-			client, err := m.MembershipClient(broadcastCtx, p.Address)
-			if err != nil {
-				return
-			}
-			if _, err = client.NodeStatus(broadcastCtx, req); err != nil {
-				slog.Debug("NodeStatus broadcast failed", "to", p.NodeID, "err", err)
-			}
-		}(peer)
-	}
+	// Broadcast to all UP peers.
+	util.Broadcast(ctx, m.upPeers(), 3*time.Second, func(broadcastCtx context.Context, peer Peer) error {
+		client, err := m.MembershipClient(broadcastCtx, peer.Address)
+		if err != nil {
+			return err
+		}
+		_, err = client.NodeStatus(broadcastCtx, req)
+		return err
+	})
 }
 
 // ─── State: self ─────────────────────────────────────────────────────────────

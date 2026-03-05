@@ -6,6 +6,7 @@ import (
 	"math/rand/v2"
 	"time"
 
+	"github.com/jackstoller/p2p-messaging/internal/util"
 	pb "github.com/jackstoller/p2p-messaging/proto/mesh"
 )
 
@@ -40,7 +41,9 @@ func (m *Manager) runHeartbeatTick(ctx context.Context) {
 
 // pingNode runs the full heartbeat flow for a single peer
 func (m *Manager) pingNode(ctx context.Context, target Peer) {
-	if m.IsDown(suspect.NodeID) { return }
+	if m.IsDown(suspect.NodeID) {
+		return
+	}
 
 	// Step 1: First ping attempt.
 	if m.sendPing(ctx, target) == nil {
@@ -59,7 +62,9 @@ func (m *Manager) pingNode(ctx context.Context, target Peer) {
 		case <-time.After(pingRetryDelay):
 		}
 
-		if m.IsDown(suspect.NodeID) { return }
+		if m.IsDown(suspect.NodeID) {
+			return
+		}
 		if !m.IsSuspect(target.NodeID) {
 			// Peer came back.
 			return
@@ -80,7 +85,9 @@ func (m *Manager) pingNode(ctx context.Context, target Peer) {
 // confirmSuspect asks up to 5 non-suspect active peers whether they can also
 // not reach the suspect. A strict majority triggers declareDown.
 func (m *Manager) confirmSuspect(ctx context.Context, suspect Peer) {
-	if m.IsDown(suspect.NodeID) { return }
+	if m.IsDown(suspect.NodeID) {
+		return
+	}
 
 	// Step 1: Get non-suspect, non-self peers.
 	candidates := m.confirmerCandidates(suspect.NodeID)
@@ -124,15 +131,19 @@ func (m *Manager) confirmSuspect(ctx context.Context, suspect Peer) {
 		r := <-resultCh
 
 		// Unresponsive nodes are excluded
-		if !r.responsive { continue }
-		
+		if !r.responsive {
+			continue
+		}
+
 		denominator++
 		if r.confirmed {
 			confirmations++
 		}
 	}
 
-	if m.IsDown(suspect.NodeID) { return }
+	if m.IsDown(suspect.NodeID) {
+		return
+	}
 
 	// Step 3: Determine quorum.
 	// On meshes of 3 nodes or fewer there may be no other peers to ask
@@ -155,22 +166,24 @@ func (m *Manager) declareDown(ctx context.Context, dead Peer) {
 		NodeId: dead.NodeID,
 		State:  pb.PeerState_PEER_DOWN,
 	}
-	for _, peer := range m.upPeers() { // TODO: add a broadcast util
-		if peer.NodeID == dead.NodeID {
-			continue
+
+	// Filter out the dead peer from the list of recipients.
+	var recipients []Peer
+	for _, peer := range m.upPeers() {
+		if peer.NodeID != dead.NodeID {
+			recipients = append(recipients, peer)
 		}
-		go func(p Peer) {
-			broadcastCtx, cancel := context.WithTimeout(context.Background(), pingTimeout)
-			defer cancel()
-			client, err := m.MembershipClient(broadcastCtx, p.Address)
-			if err != nil {
-				return
-			}
-			if _, err = client.NodeStatus(broadcastCtx, req); err != nil {
-				slog.Debug("DOWN broadcast failed", "to", p.NodeID, "err", err)
-			}
-		}(peer)
 	}
+
+	// Broadcast to all UP peers (except the dead one).
+	util.Broadcast(ctx, recipients, pingTimeout, func(broadcastCtx context.Context, peer Peer) error {
+		client, err := m.MembershipClient(broadcastCtx, peer.Address)
+		if err != nil {
+			return err
+		}
+		_, err = client.NodeStatus(broadcastCtx, req)
+		return err
+	})
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
