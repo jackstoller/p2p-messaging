@@ -1,3 +1,8 @@
+
+## Starting
+
+`docker compose down -v && docker compose up --build`
+
 ## Protocols
 
 ### Join Flow
@@ -47,23 +52,25 @@
 `Local`: The node initiating the transfer of the range to itself.
 `Remote`: The node who initially holds the range.
 
-1. `Local` sends a `RangeTransferRequest` to `Remote`, `Remote` accepts unless the range is already being transferred or if the `Remote` range is still in `INACTIVE`
+> Example: ring `0-100` with active vnodes at `10`, `40`, `80`. If new vnode `60` joins, `Local` claims `(40,60]` from the vnode at `80`. The vnode at `80` remains active and keeps `(60,80]`.
 
-2. If the `RangeTransferRequest` is denied, `Local` waits with an exponential backoff up to 30 minutes. `Remote` will be recomputed each time.
+1. `Local` sends a `RequestRangeTransfer` for its target vnode range to `Remote`. `Remote` accepts unless that exact range segment is already being transferred or the source vnode is `INACTIVE`.
+
+2. If the `RequestRangeTransfer` is denied, `Local` waits with an exponential backoff up to 30 minutes. `Remote` will be recomputed each time.
 
 3. `Remote` marks the range internally as transferring, refusing all other transfer requests and begins to buffer all write requests to that range, but does not stop applying them locally. Read requests are not changed.
 
-4. `Remote` begins to stream the range data to `Local`
+4. `Remote` begins to stream only records whose hash positions are inside the accepted range `(start, end]`.
 
 5. When all data is transferred, `Remote` begins to send the buffered write requests and continues to send write requests as they are received (and still applied locally)
 
-6. `Local` begins to request control by sending a `RangeTransferComplete` message. `Remote` will not accept until it's write buffer is emptied and all write requests have been acknowledged by `Local`. `Remote` will wait up to 5s before rejecting a request. `Local` will retry up to 5 times.
+6. `Local` begins to request control by sending a `CompleteRangeTransfer` message. `Remote` will not accept until it's write buffer is emptied and all write requests have been acknowledged by `Local`. `Remote` will wait up to 5s before rejecting a request. `Local` will retry up to 5 times.
 
-7. Once `Remote` has accepted the message it rejects all write messages while still accepting reads. `Remote` still acts as the primary.
+7. Once `Remote` has accepted the message it rejects all write messages while still accepting reads. `Remote` still acts as the primary for the source remainder range.
 
 8. Once `Local` receives the accepted message, it marks the ranges internally as `ACTIVE` and then broadcasts a `RangeStatusUpdate` message to all nodes in the mesh.
 
-9. Once `Remote` has received this broadcast it no longer acts as the primary. `Remote` will drop data in this range.
+9. Once `Remote` has received this broadcast it no longer acts as the primary for the transferred segment and drops only data in that segment. The source vnode stays active for its remaining range.
 
 > Note: There is a chance writes sent between 6 and 7 are rejected. As this is a quick change, all nodes making write requests are expected to include some level of retry which would resolve this.
 

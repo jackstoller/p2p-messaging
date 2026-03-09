@@ -16,18 +16,18 @@ const DefaultVnodeCount = 5
 // is responsible for filtering before calling Rebuild.
 type VnodeEntry struct {
 	Position uint64
-	NodeID   string
-	Address  string // TODO <- This seems redundant
+	NodeId   string
+	Address  string
 }
 
 // OwnedRange describes a contiguous arc [Start, End] of the ring that one
 // physical node is primary for. Start is exclusive, End is inclusive.
 type OwnedRange struct {
-	VnodeID string // set by the caller; the ring stores it opaquely
+	VnodeId string // set by the caller; the ring stores it opaquely
 	Start   uint64
 	End     uint64
-	NodeID  string
-	Address string // TODO <- This seems redundant
+	NodeId  string
+	Address string
 }
 
 // InRange reports whether pos falls in (Start, End], handling wrap-around.
@@ -99,8 +99,8 @@ func (r *Ring) ResponsibleNodes(key string, n int) []VnodeEntry {
 	result := make([]VnodeEntry, 0, n)
 	for i := 0; i < len(pts) && len(result) < n; i++ {
 		p := pts[(idx+i)%len(pts)]
-		if _, dup := seen[p.NodeID]; !dup {
-			seen[p.NodeID] = struct{}{}
+		if _, dup := seen[p.NodeId]; !dup {
+			seen[p.NodeId] = struct{}{}
 			result = append(result, p)
 		}
 	}
@@ -108,9 +108,9 @@ func (r *Ring) ResponsibleNodes(key string, n int) []VnodeEntry {
 }
 
 // Predecessor returns the nearest distinct physical node counterclockwise from
-// position, excluding excludeNodeID. Used by the transfer flow to find the
+// position, excluding excludeNodeId. Used by the transfer flow to find the
 // node that currently owns a range before the joining node takes it over.
-func (r *Ring) Predecessor(position uint64, excludeNodeID string) (VnodeEntry, bool) {
+func (r *Ring) Predecessor(position uint64, excludeNodeId string) (VnodeEntry, bool) {
 	r.mu.RLock()
 	pts := r.points
 	r.mu.RUnlock()
@@ -122,24 +122,24 @@ func (r *Ring) Predecessor(position uint64, excludeNodeID string) (VnodeEntry, b
 	idx := sort.Search(len(pts), func(i int) bool { return pts[i].Position >= position })
 	for i := 1; i <= len(pts); i++ {
 		p := pts[(idx-i+len(pts))%len(pts)]
-		if p.NodeID != excludeNodeID {
+		if p.NodeId != excludeNodeId {
 			return p, true
 		}
 	}
 	return VnodeEntry{}, false
 }
 
-// OwnedRanges returns the arcs of the ring for which nodeID is the clockwise
-// endpoint, i.e. the ranges the node is primary for. The VnodeID field on
+// OwnedRanges returns the arcs of the ring for which nodeId is the clockwise
+// endpoint, i.e. the ranges the node is primary for. The VnodeId field on
 // each returned OwnedRange is empty; callers may populate it themselves.
-func (r *Ring) OwnedRanges(nodeID string) []OwnedRange {
+func (r *Ring) OwnedRanges(nodeId string) []OwnedRange {
 	r.mu.RLock()
 	pts := r.points
 	r.mu.RUnlock()
 
 	var owned []OwnedRange
 	for i, p := range pts {
-		if p.NodeID != nodeID {
+		if p.NodeId != nodeId {
 			continue
 		}
 		start := uint64(0)
@@ -149,20 +149,20 @@ func (r *Ring) OwnedRanges(nodeID string) []OwnedRange {
 		owned = append(owned, OwnedRange{
 			Start:   start,
 			End:     p.Position,
-			NodeID:  p.NodeID,
+			NodeId:  p.NodeId,
 			Address: p.Address,
 		})
 	}
 
-	// Handle wrap-around: the first ring point owned by nodeID has its start
+	// Handle wrap-around: the first ring point owned by nodeId has its start
 	// at the last ring position rather than 0.
-	if len(pts) > 0 && len(owned) > 0 && pts[0].NodeID == nodeID {
+	if len(pts) > 0 && len(owned) > 0 && pts[0].NodeId == nodeId {
 		owned[0].Start = pts[len(pts)-1].Position
 	}
 	return owned
 }
 
-// ─── Position helpers ────────────────────────────────────────────────────────
+// Position helpers
 
 // KeyPosition returns the ring position for an arbitrary string key.
 func KeyPosition(key string) uint64 {
@@ -171,13 +171,13 @@ func KeyPosition(key string) uint64 {
 }
 
 // VnodePosition returns the deterministic ring position for a virtual node
-// identified by its physical node ID and index. This is the canonical
+// identified by its physical node Id and index. This is the canonical
 // formula; every participant must use it to agree on ring layout.
-func VnodePosition(nodeID string, index int) uint64 {
-	return KeyPosition(fmt.Sprintf("%s:%d", nodeID, index))
+func VnodePosition(nodeId string, index int) uint64 {
+	return KeyPosition(fmt.Sprintf("%s:%d", nodeId, index))
 }
 
-// VnodeID returns the string identifier for a virtual node.
-func VnodeID(nodeID string, index int) string {
-	return fmt.Sprintf("%s:%d", nodeID, index)
+// VnodeId returns the string identifier for a virtual node.
+func VnodeId(nodeId string, index int) string {
+	return fmt.Sprintf("%s:%d", nodeId, index)
 }

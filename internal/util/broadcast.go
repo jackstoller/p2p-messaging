@@ -8,7 +8,7 @@ import (
 
 // BroadcastPeer represents a peer that can receive a broadcast.
 type BroadcastPeer interface {
-	GetNodeID() string
+	GetNodeId() string
 }
 
 // BroadcastSender is a function that sends a message to a single peer.
@@ -27,7 +27,7 @@ func Broadcast[P BroadcastPeer](ctx context.Context, peers []P, timeout time.Dur
 			broadcastCtx, cancel := context.WithTimeout(context.Background(), timeout)
 			defer cancel()
 			if err := sender(broadcastCtx, p); err != nil {
-				slog.Debug("broadcast failed", "to", p.GetNodeID(), "err", err)
+				slog.Debug("broadcast failed", "to", p.GetNodeId(), "err", err)
 			}
 		}(peer)
 	}

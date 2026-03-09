@@ -9,7 +9,7 @@ import (
 
 // Runtime configuration for a node.
 type NodeConfig struct {
-	NodeID         string
+	NodeId         string
 	ListenAddr     string   // e.g. ":9000" - the gRPC address this node binds to
 	AdvertiseAddr  string   // e.g. "node1:9000" - what peers use to dial this node
 	BootstrapPeers []string // addresses of seed nodes, empty if first in network
@@ -20,7 +20,6 @@ type NodeConfig struct {
 	NodeCertPath string
 	NodeKeyPath  string
 }
-
 
 // TLSConfig builds a mutual-TLS configuration for inter-node communication.
 //
@@ -48,9 +47,9 @@ func TLSConfig(caCertPath, nodeCertPath, nodeKeyPath string) (*tls.Config, error
 
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		ClientAuth: tls.RequireAndVerifyClientCert,
-		ClientCAs:  pool,
-		RootCAs:    pool,
-		MinVersion: tls.VersionTLS13,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    pool,
+		RootCAs:      pool,
+		MinVersion:   tls.VersionTLS13,
 	}, nil
 }

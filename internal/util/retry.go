@@ -19,18 +19,18 @@ type Config struct {
 	MaxDelay time.Duration
 }
 
-// Named presets — use these rather than constructing Config ad-hoc.
+// Named presets to avoid ad hoc retry settings.
 var (
-	// HeartbeatRetry: 3 attempts, 3 s apart (spec: retry 3 times with 3s delay).
+	// HeartbeatRetry runs 3 attempts, 3 seconds apart.
 	HeartbeatRetry = Config{MaxAttempts: 3, InitialDelay: 3 * time.Second, Multiplier: 1.0}
 
-	// TransferBackoff: unlimited, exponential up to 30 min (spec: backoff up to 30 minutes).
+	// TransferBackoff retries forever with exponential delay up to 30 minutes.
 	TransferBackoff = Config{MaxAttempts: -1, InitialDelay: 1 * time.Second, Multiplier: 2.0, MaxDelay: 30 * time.Minute}
 
-	// TransferComplete: 5 attempts, 500 ms apart (spec: retry up to 5 times).
+	// TransferComplete runs 5 attempts, 500 milliseconds apart.
 	TransferComplete = Config{MaxAttempts: 5, InitialDelay: 500 * time.Millisecond, Multiplier: 1.0}
 
-	// RPC: 3 attempts, 200 ms apart — general short-lived inter-node calls.
+	// RPC runs 3 attempts, 200 milliseconds apart for short inter-node calls.
 	RPC = Config{MaxAttempts: 3, InitialDelay: 200 * time.Millisecond, Multiplier: 1.0}
 )
 

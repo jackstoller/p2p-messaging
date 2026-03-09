@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/jackstoller/p2p-messaging/internal/util"
-	pb "github.com/jackstoller/p2p-messaging/proto/mesh"
+	pb "github.com/jackstoller/p2p-messaging/proto"
 )
 
 const (
@@ -18,7 +18,7 @@ const (
 	maxConfirmPeers   = 5
 )
 
-// RunHeartbeats starts the heartbeat loop. Blocks until ctx is cancelled.
+// RunHeartbeats starts the heartbeat loop and runs until ctx is canceled.
 func (m *Manager) RunHeartbeats(ctx context.Context) {
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
@@ -32,7 +32,7 @@ func (m *Manager) RunHeartbeats(ctx context.Context) {
 	}
 }
 
-// runHeartbeatTick pings all active, non-suspect, non-self peers in parallel.
+// runHeartbeatTick pings active peers except self and local suspects.
 func (m *Manager) runHeartbeatTick(ctx context.Context) {
 	for _, target := range m.ActivePeers() {
 		go m.pingNode(ctx, target)
@@ -41,19 +41,19 @@ func (m *Manager) runHeartbeatTick(ctx context.Context) {
 
 // pingNode runs the full heartbeat flow for a single peer
 func (m *Manager) pingNode(ctx context.Context, target Peer) {
-	if m.IsDown(suspect.NodeID) {
+	if m.IsDown(target.NodeId) {
 		return
 	}
 
-	// Step 1: First ping attempt.
+	// Step 1 first ping attempt
 	if m.sendPing(ctx, target) == nil {
-		m.ClearSuspect(target.NodeID)
+		m.ClearSuspect(target.NodeId)
 		return
 	}
 
-	// Step 2: Mark locally as suspect and retry 3 times with 3s delay.
-	m.MarkSuspect(target.NodeID)
-	slog.Warn("peer suspect", "nodeID", target.NodeID, "attempt", 0)
+	// Step 2 mark as suspect and retry three times
+	m.MarkSuspect(target.NodeId)
+	slog.Warn("peer suspect", "nodeId", target.NodeId, "attempt", 0)
 
 	for i := 0; i < pingRetries; i++ {
 		select {
@@ -62,35 +62,35 @@ func (m *Manager) pingNode(ctx context.Context, target Peer) {
 		case <-time.After(pingRetryDelay):
 		}
 
-		if m.IsDown(suspect.NodeID) {
+		if m.IsDown(target.NodeId) {
 			return
 		}
-		if !m.IsSuspect(target.NodeID) {
+		if !m.IsSuspect(target.NodeId) {
 			// Peer came back.
 			return
 		}
 
 		if m.sendPing(ctx, target) == nil {
-			m.ClearSuspect(target.NodeID)
-			slog.Info("peer recovered", "nodeID", target.NodeID)
+			m.ClearSuspect(target.NodeId)
+			slog.Info("peer recovered", "nodeId", target.NodeId)
 			return
 		}
-		slog.Warn("peer suspect", "nodeID", target.NodeID, "attempt", i+1)
+		slog.Warn("peer suspect", "nodeId", target.NodeId, "attempt", i+1)
 	}
 
-	// Step 3: All retries exhausted - gather peer confirmation.
+	// Step 3 retries exhausted so gather peer confirmation
 	m.confirmSuspect(ctx, target)
 }
 
 // confirmSuspect asks up to 5 non-suspect active peers whether they can also
 // not reach the suspect. A strict majority triggers declareDown.
 func (m *Manager) confirmSuspect(ctx context.Context, suspect Peer) {
-	if m.IsDown(suspect.NodeID) {
+	if m.IsDown(suspect.NodeId) {
 		return
 	}
 
-	// Step 1: Get non-suspect, non-self peers.
-	candidates := m.confirmerCandidates(suspect.NodeID)
+	// Step 1 pick non suspect peers excluding self
+	candidates := m.confirmerCandidates(suspect.NodeId)
 
 	type pollResult struct {
 		responsive bool
@@ -98,11 +98,11 @@ func (m *Manager) confirmSuspect(ctx context.Context, suspect Peer) {
 	}
 	resultCh := make(chan pollResult, len(candidates))
 
-	// Step 2: Check with peers
+	// Step 2 ask peers in parallel
 	for _, peer := range candidates {
 		go func(p Peer) {
-			if m.IsDown(suspect.NodeID) {
-				// Already resolved, drain channel
+			if m.IsDown(suspect.NodeId) {
+				// Already resolved so drain the channel
 				resultCh <- pollResult{}
 				return
 			}
@@ -115,7 +115,7 @@ func (m *Manager) confirmSuspect(ctx context.Context, suspect Peer) {
 				return
 			}
 			resp, err := client.ConfirmSuspect(pollCtx, &pb.ConfirmSuspectRequest{
-				SuspectNodeId: suspect.NodeID,
+				SuspectNodeId: suspect.NodeId,
 			})
 			if err != nil {
 				resultCh <- pollResult{responsive: false}
@@ -125,12 +125,12 @@ func (m *Manager) confirmSuspect(ctx context.Context, suspect Peer) {
 		}(peer)
 	}
 
-	// Collect results.
+	// Collect results
 	confirmations, denominator := 0, 0
 	for range candidates {
 		r := <-resultCh
 
-		// Unresponsive nodes are excluded
+		// Exclude unresponsive nodes
 		if !r.responsive {
 			continue
 		}
@@ -141,41 +141,40 @@ func (m *Manager) confirmSuspect(ctx context.Context, suspect Peer) {
 		}
 	}
 
-	if m.IsDown(suspect.NodeID) {
+	if m.IsDown(suspect.NodeId) {
 		return
 	}
 
-	// Step 3: Determine quorum.
-	// On meshes of 3 nodes or fewer there may be no other peers to ask
-	// (denominator == 0); in that case our own repeated failures are sufficient.
+	// Step 3 determine quorum
+	// On meshes of 3 nodes or fewer there may be no peers to ask.
+	// If denominator is zero, repeated local failures are enough.
 	quorumMet := denominator == 0 || float64(confirmations)/float64(denominator) > 0.5
 	if quorumMet {
 		m.declareDown(ctx, suspect)
 	}
 }
 
-// declareDown marks a peer dead locally and broadcasts NodeStatus(DOWN) to all
-// UP peers. The first node to broadcast wins; duplicate DOWN messages are
-// ignored by recipients.
+// declareDown marks a peer dead locally and broadcasts NodeStatus DOWN.
+// The first broadcaster wins and duplicate DOWN messages are ignored.
 func (m *Manager) declareDown(ctx context.Context, dead Peer) {
-	// Mark locally first so IsDown() is true before we broadcast.
-	m.MarkDown(dead.NodeID)
-	slog.Warn("declaring peer down", "nodeID", dead.NodeID)
+	// Mark locally first so IsDown is true before broadcasting
+	m.MarkDown(dead.NodeId)
+	slog.Warn("declaring peer down", "nodeId", dead.NodeId)
 
 	req := &pb.NodeStatusRequest{
-		NodeId: dead.NodeID,
+		NodeId: dead.NodeId,
 		State:  pb.PeerState_PEER_DOWN,
 	}
 
-	// Filter out the dead peer from the list of recipients.
+	// Filter out the dead peer from recipients
 	var recipients []Peer
 	for _, peer := range m.upPeers() {
-		if peer.NodeID != dead.NodeID {
+		if peer.NodeId != dead.NodeId {
 			recipients = append(recipients, peer)
 		}
 	}
 
-	// Broadcast to all UP peers (except the dead one).
+	// Broadcast to all remaining UP peers
 	util.Broadcast(ctx, recipients, pingTimeout, func(broadcastCtx context.Context, peer Peer) error {
 		client, err := m.MembershipClient(broadcastCtx, peer.Address)
 		if err != nil {
@@ -186,9 +185,9 @@ func (m *Manager) declareDown(ctx context.Context, dead Peer) {
 	})
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// Helper methods
 
-// sendPing sends a single Ping to target's address with a pingTimeout deadline.
+// sendPing sends one Ping to target with a timeout.
 func (m *Manager) sendPing(ctx context.Context, target Peer) error {
 	pingCtx, cancel := context.WithTimeout(ctx, pingTimeout)
 	defer cancel()
@@ -196,24 +195,24 @@ func (m *Manager) sendPing(ctx context.Context, target Peer) error {
 	if err != nil {
 		return err
 	}
-	_, err = client.Ping(pingCtx, &pb.PingRequest{NodeId: m.selfID})
+	_, err = client.Ping(pingCtx, &pb.PingRequest{NodeId: m.selfId})
 	return err
 }
 
-// confirmerCandidates returns up to maxConfirmPeers shuffled UP non-suspect
-// peers, excluding self and the suspect.
-func (m *Manager) confirmerCandidates(suspectID string) []Peer {
+// confirmerCandidates returns up to maxConfirmPeers shuffled non suspect peers.
+// The list excludes self and the current suspect.
+func (m *Manager) confirmerCandidates(suspectId string) []Peer {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	m.suspectsMu.Lock()
-	defer m.suspectsMu.Unlock()
+	m.suspectsMu.RLock()
+	defer m.suspectsMu.RUnlock()
 
 	var pool []Peer
 	for _, p := range m.members {
-		if p.NodeID == m.selfID || p.NodeID == suspectID || p.State == PeerDown {
+		if p.NodeId == m.selfId || p.NodeId == suspectId || p.State == PeerDown {
 			continue
 		}
-		if _, isSuspect := m.suspects[p.NodeID]; isSuspect {
+		if _, isSuspect := m.suspects[p.NodeId]; isSuspect {
 			continue
 		}
 		pool = append(pool, *p)
