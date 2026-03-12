@@ -3,6 +3,7 @@ package transfer
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/jackstoller/p2p-messaging/internal/membership"
 	"github.com/jackstoller/p2p-messaging/internal/ring"
@@ -12,8 +13,8 @@ import (
 )
 
 func (m *Manager) RequestRangeTransfer(_ context.Context, req *pb.RequestRangeTransferRequest) (*pb.RequestRangeTransferResponse, error) {
-	if req.TargetVnodeId == "" || req.Requestor == "" {
-		return nil, errors.New("transfer: vnode_id and requestor are required")
+	if req.TargetRange == nil || req.TransferId == "" || req.Requestor == "" {
+		return nil, errors.New("transfer: target_range, transfer_id, and requestor are required")
 	}
 
 	requestor, ok := m.mgr.PeerById(req.Requestor)
@@ -21,29 +22,23 @@ func (m *Manager) RequestRangeTransfer(_ context.Context, req *pb.RequestRangeTr
 		return &pb.RequestRangeTransferResponse{Accepted: false}, nil
 	}
 
-	var targetPos uint64
-	foundTarget := false
-	for _, vn := range requestor.Vnodes {
-		if vn.Id != req.TargetVnodeId {
-			continue
-		}
-		targetPos = vn.Position
-		foundTarget = true
-		break
-	}
-	if !foundTarget {
+	targetVnode, ok := findVnodeByPosition(requestor, req.TargetRange.End)
+	if !ok {
 		return &pb.RequestRangeTransferResponse{Accepted: false}, nil
 	}
 
-	plan, ok := m.currentOwnerRangeForTarget(targetPos, req.Requestor)
-	if !ok || plan.owner.NodeId != m.mgr.SelfId() {
+	owner, rangeStart, ok := m.currentOwnerForPosition(targetVnode.Position)
+	if !ok || owner.NodeId != m.mgr.SelfId() {
+		return &pb.RequestRangeTransferResponse{Accepted: false}, nil
+	}
+	if req.TargetRange.Start != rangeStart || req.TargetRange.End != targetVnode.Position {
 		return &pb.RequestRangeTransferResponse{Accepted: false}, nil
 	}
 
 	self := m.mgr.Self()
 	ownedActive := false
 	for _, vn := range self.Vnodes {
-		if vn.Id == plan.sourceVnodeId && vn.State == membership.VnodeActive {
+		if vn.Id == owner.Id && vn.State == membership.VnodeActive {
 			ownedActive = true
 			break
 		}
@@ -52,68 +47,67 @@ func (m *Manager) RequestRangeTransfer(_ context.Context, req *pb.RequestRangeTr
 		return &pb.RequestRangeTransferResponse{Accepted: false}, nil
 	}
 
-	key := transferKey(plan.sourceVnodeId, plan.rangeStart, plan.rangeEnd)
+	state := ownerTransferState{
+		TransferID:      req.TransferId,
+		StreamID:        streamIDForTransfer(req.TransferId),
+		RequestorNodeID: requestor.NodeId,
+		RequestorAddr:   requestor.Address,
+		SourceVnodeID:   owner.Id,
+		TargetVnodeID:   targetVnode.Id,
+		Range: ring.OwnedRange{
+			Start:   rangeStart,
+			End:     targetVnode.Position,
+			NodeId:  owner.NodeId,
+			Address: owner.Address,
+		},
+	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if _, exists := m.inProgress[key]; exists {
+	if !m.startOwnerTransfer(state) {
 		return &pb.RequestRangeTransferResponse{Accepted: false}, nil
-	}
-	for _, active := range m.inProgress {
-		if active.targetVnode == req.TargetVnodeId {
-			return &pb.RequestRangeTransferResponse{Accepted: false}, nil
-		}
-	}
-
-	m.inProgress[key] = &transferState{
-		requestor:   req.Requestor,
-		targetVnode: req.TargetVnodeId,
-		sourceVnode: plan.sourceVnodeId,
-		rangeStart:  plan.rangeStart,
-		rangeEnd:    plan.rangeEnd,
 	}
 
 	return &pb.RequestRangeTransferResponse{Accepted: true}, nil
 }
 
-func (m *Manager) getTransferByTarget(targetVnodeId string) (string, *transferState, bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	for key, state := range m.inProgress {
-		if state.targetVnode == targetVnodeId {
-			return key, state, true
+func findVnodeByPosition(peer membership.Peer, position uint64) (membership.Vnode, bool) {
+	for _, vnode := range peer.Vnodes {
+		if vnode.Position == position {
+			return vnode, true
 		}
 	}
-	return "", nil, false
+	return membership.Vnode{}, false
 }
 
 func (m *Manager) StreamRange(req *pb.StreamRangeRequest, stream grpc.ServerStreamingServer[pb.RangeDataChunk]) error {
-	if req.TargetVnodeId == "" {
-		return errors.New("transfer: vnode_id is required")
+	if req.TransferId == 0 {
+		return errors.New("transfer: transfer_id is required")
 	}
 
-	_, state, ok := m.getTransferByTarget(req.TargetVnodeId)
+	state, ok := m.ownerTransferByStreamID(req.TransferId)
 	if !ok {
 		return errors.New("transfer: stream requested without accepted transfer")
 	}
 
-	records, err := m.store.GetRecordsByVnode(state.sourceVnode)
+	records, err := m.store.GetRecordsByVnode(state.SourceVnodeID)
 	if err != nil {
 		return err
 	}
 
-	rng := ring.OwnedRange{Start: state.rangeStart, End: state.rangeEnd}
 	filtered := make([]storage.Record, 0, len(records))
 	for _, rec := range records {
-		if rng.InRange(ring.KeyPosition(rec.Key)) {
+		if state.Range.InRange(ring.KeyPosition(rec.Key)) {
 			filtered = append(filtered, rec)
 		}
 	}
 
 	seq := int32(0)
 	if len(filtered) == 0 {
-		return stream.Send(&pb.RangeDataChunk{TargetVnodeId: req.TargetVnodeId, Seq: seq, Final: true})
+		if err := stream.Send(finalRangeChunk(state.TransferID, seq)); err != nil {
+			return err
+		}
+		m.setOwnerTransferLive(state.TransferID)
+		_ = m.flushBufferedWrites(stream.Context(), state.TransferID)
+		return nil
 	}
 
 	for start := 0; start < len(filtered); start += streamChunkSize {
@@ -128,16 +122,18 @@ func (m *Manager) StreamRange(req *pb.StreamRangeRequest, stream grpc.ServerStre
 		}
 
 		if err := stream.Send(&pb.RangeDataChunk{
-			TargetVnodeId: req.TargetVnodeId,
-			Seq:           seq,
-			Final:         end == len(filtered),
-			Records:       chunkRecords,
+			TransferId: state.TransferID,
+			Seq:        seq,
+			IsFinal:    end == len(filtered),
+			Records:    chunkRecords,
 		}); err != nil {
 			return err
 		}
 		seq++
 	}
 
+	m.setOwnerTransferLive(state.TransferID)
+	_ = m.flushBufferedWrites(stream.Context(), state.TransferID)
 	return nil
 }
 
@@ -146,10 +142,15 @@ func (m *Manager) ForwardWrite(_ context.Context, req *pb.ForwardWriteRequest) (
 		return nil, errors.New("transfer: record is required")
 	}
 
+	claim, ok := m.claimForKey(req.Record.Key)
+	if !ok {
+		return nil, fmt.Errorf("transfer: no local claim for key %s", req.Record.Key)
+	}
+
 	_, err := m.store.UpsertRecord(storage.Record{
 		Key:       req.Record.Key,
 		Value:     req.Record.Value,
-		VnodeId:   "",
+		VnodeId:   claim.TargetVnodeID,
 		Timestamp: req.Record.Timestamp,
 	})
 	if err != nil {
@@ -158,33 +159,40 @@ func (m *Manager) ForwardWrite(_ context.Context, req *pb.ForwardWriteRequest) (
 	return &pb.ForwardWriteResponse{WriteId: req.WriteId}, nil
 }
 
-func (m *Manager) CompleteRangeTransfer(_ context.Context, req *pb.CompleteRangeTransferRequest) (*pb.CompleteRangeTransferResponse, error) {
-	if req.TargetVnodeId == "" {
-		return nil, errors.New("transfer: vnode_id is required")
+func (m *Manager) CompleteRangeTransfer(ctx context.Context, req *pb.CompleteRangeTransferRequest) (*pb.CompleteRangeTransferResponse, error) {
+	if req.TransferId == "" {
+		return nil, errors.New("transfer: transfer_id is required")
 	}
 
-	m.mu.Lock()
-	var (
-		state *transferState
-		key   string
-	)
-	for k, inFlight := range m.inProgress {
-		if inFlight.targetVnode == req.TargetVnodeId {
-			key = k
-			state = inFlight
-			break
-		}
+	state, ok := m.ownerTransferByID(req.TransferId)
+	if !ok {
+		return &pb.CompleteRangeTransferResponse{Accepted: false}, nil
 	}
-	if state != nil {
-		delete(m.inProgress, key)
-	}
-	m.mu.Unlock()
-	if state == nil {
+	if !state.LiveForwarding {
 		return &pb.CompleteRangeTransferResponse{Accepted: false}, nil
 	}
 
-	if err := m.store.DeleteRecordsInVnodeRange(state.sourceVnode, state.rangeStart, state.rangeEnd); err != nil {
+	if err := m.flushBufferedWrites(ctx, req.TransferId); err != nil {
+		return &pb.CompleteRangeTransferResponse{Accepted: false}, nil
+	}
+	if m.bufferedWriteCount(req.TransferId) > 0 {
+		return &pb.CompleteRangeTransferResponse{Accepted: false}, nil
+	}
+	if !m.setOwnerTransferCutover(req.TransferId, true) {
+		return &pb.CompleteRangeTransferResponse{Accepted: false}, nil
+	}
+
+	if err := m.store.DeleteRecordsInVnodeRange(state.SourceVnodeID, state.Range.Start, state.Range.End); err != nil {
+		m.setOwnerTransferCutover(req.TransferId, false)
 		return nil, err
 	}
 	return &pb.CompleteRangeTransferResponse{Accepted: true}, nil
+}
+
+func finalRangeChunk(transferID string, seq int32) *pb.RangeDataChunk {
+	return &pb.RangeDataChunk{
+		TransferId: transferID,
+		Seq:        seq,
+		IsFinal:    true,
+	}
 }

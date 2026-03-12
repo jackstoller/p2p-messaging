@@ -8,19 +8,20 @@ import (
 	pb "github.com/jackstoller/p2p-messaging/proto"
 )
 
-// RangeStatusUpdate announces that a target vnode range is now active.
-func (s *Server) RangeStatusUpdate(_ context.Context, req *pb.RangeStatusUpdateRequest) (*pb.RangeStatusUpdateResponse, error) {
+// VNodeStatusUpdate announces that a target vnode is now active.
+func (s *Server) VNodeStatusUpdate(_ context.Context, req *pb.VNodeStatusUpdateRequest) (*pb.VNodeStatusUpdateResponse, error) {
 	if req.State != pb.VnodeState_VNODE_ACTIVE {
-		return &pb.RangeStatusUpdateResponse{}, nil
+		return &pb.VNodeStatusUpdateResponse{}, nil
 	}
 
-	s.mgr.SetVnodeState(req.OwnerId, req.TargetVnodeId, membership.VnodeActive)
-	if req.OwnerId == s.mgr.SelfId() {
+	s.mgr.SetVnodeState(req.NodeId, req.TargetVnodeId, membership.VnodeActive)
+	s.xfer.ClearCompletedTransfer(req.TargetVnodeId, req.NodeId)
+	if req.NodeId == s.mgr.SelfId() {
 		s.repl.OnVnodeActive(context.Background(), req.TargetVnodeId)
 	}
 
-	slog.Info("RangeStatusUpdate ACTIVE", "targetVnodeId", req.TargetVnodeId, "owner", req.OwnerId)
-	return &pb.RangeStatusUpdateResponse{}, nil
+	slog.Info("VNodeStatusUpdate ACTIVE", "targetVnodeId", req.TargetVnodeId, "owner", req.NodeId)
+	return &pb.VNodeStatusUpdateResponse{}, nil
 }
 
 func (s *Server) RequestRangeTransfer(ctx context.Context, req *pb.RequestRangeTransferRequest) (*pb.RequestRangeTransferResponse, error) {

@@ -45,7 +45,12 @@ func (m *Manager) getActiveVnodeEntriesLocked() []ring.VnodeEntry {
 			if vn.State != VnodeActive {
 				continue
 			}
-			entries = append(entries, ring.VnodeEntry{Position: vn.Position, NodeId: peer.NodeId, Address: peer.Address})
+			entries = append(entries, ring.VnodeEntry{
+				Id:       vn.Id,
+				Position: vn.Position,
+				NodeId: peer.NodeId,
+				Address: peer.Address,
+			})
 		}
 	}
 	return entries

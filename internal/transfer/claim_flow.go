@@ -5,8 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
-	"sort"
 	"sync"
 
 	"github.com/jackstoller/p2p-messaging/internal/membership"
@@ -16,36 +14,25 @@ import (
 	pb "github.com/jackstoller/p2p-messaging/proto"
 )
 
-// ClaimVirtualNodes computes the virtual nodes this node should own as primary,
-// then claims each missing vnode concurrently from its current owner.
+// Attempts to activate all inactive virtual nodes by transferring
+// ranges to itself and activating
 func (m *Manager) ClaimVirtualNodes(ctx context.Context) error {
 	self := m.mgr.Self()
-	targets := m.computeTargetVnodes(self)
+	targets := m.getInactiveVnodes(self)
 	if len(targets) == 0 {
 		return nil
 	}
 
-	alreadyActive := map[string]struct{}{}
-	for _, vn := range self.Vnodes {
-		if vn.State == membership.VnodeActive {
-			alreadyActive[vn.Id] = struct{}{}
-		}
-	}
-
 	errCh := make(chan error, len(targets))
 	var wg sync.WaitGroup
-	for _, vnodeId := range targets {
-		if _, ok := alreadyActive[vnodeId]; ok {
-			continue
-		}
-
+	for _, vnode := range targets {
 		wg.Add(1)
-		go func(id string) {
+		go func(v membership.Vnode) {
 			defer wg.Done()
-			if err := m.claimVnode(ctx, id); err != nil {
+			if err := m.claimVnode(ctx, v); err != nil {
 				errCh <- err
 			}
-		}(vnodeId)
+		}(vnode)
 	}
 
 	wg.Wait()
@@ -58,151 +45,146 @@ func (m *Manager) ClaimVirtualNodes(ctx context.Context) error {
 	return nil
 }
 
-// ClaimTargetRanges is kept as a compatibility alias for existing callers.
-func (m *Manager) ClaimTargetRanges(ctx context.Context) error {
+func (m *Manager) ActivateVirtualNodes(ctx context.Context) error {
 	return m.ClaimVirtualNodes(ctx)
 }
 
-func (m *Manager) computeTargetVnodes(self membership.Peer) []string {
-	entries := make([]ring.VnodeEntry, 0)
-	for _, p := range m.mgr.AllMembers() {
-		if p.State == membership.PeerDown {
-			continue
-		}
-		for _, vn := range p.Vnodes {
-			if vn.State != membership.VnodeActive {
-				continue
-			}
-			entries = append(entries, ring.VnodeEntry{Position: vn.Position, NodeId: p.NodeId, Address: p.Address})
-		}
-	}
-
-	selfPos := make(map[uint64]string, len(self.Vnodes))
+func (m *Manager) getInactiveVnodes(self membership.Peer) []membership.Vnode {
+	inactive := make([]membership.Vnode, 0)
 	for _, vn := range self.Vnodes {
-		selfPos[vn.Position] = vn.Id
-		if vn.State == membership.VnodeActive {
-			continue
-		}
-		entries = append(entries, ring.VnodeEntry{Position: vn.Position, NodeId: self.NodeId, Address: self.Address})
-	}
-
-	scratch := ring.New()
-	scratch.Rebuild(entries)
-
-	ranges := scratch.OwnedRanges(self.NodeId)
-	result := make([]string, 0, len(ranges))
-	for _, r := range ranges {
-		if id, ok := selfPos[r.End]; ok {
-			result = append(result, id)
+		if vn.State != membership.VnodeActive {
+			inactive = append(inactive, vn)
 		}
 	}
-	return result
+
+	return inactive
 }
 
-type targetRangePlan struct {
-	owner         ring.VnodeEntry
-	sourceVnodeId string
-	rangeStart    uint64
-	rangeEnd      uint64
-}
-
-func (m *Manager) claimVnode(ctx context.Context, targetVnodeId string) error {
-	self := m.mgr.Self()
-	vnodePos, err := m.localVnodePosition(self, targetVnodeId)
+func (m *Manager) claimVnode(ctx context.Context, vnode membership.Vnode) error {
+	// Compute the range necessary to activate the vnode
+	plan, err := m.acquireAcceptedTransferPlan(ctx, vnode)
 	if err != nil {
 		return err
 	}
+	m.registerClaim(plan, vnode)
+	defer m.unregisterClaim(plan.TransferID)
 
-	plan, hasOwner, err := m.requestTransferWithBackoff(ctx, self.NodeId, targetVnodeId, vnodePos)
-	if err != nil {
-		return err
-	}
-	if !hasOwner {
-		return m.activateTargetRange(ctx, self.NodeId, targetVnodeId, vnodePos)
-	}
-
-	if err := m.streamSnapshot(ctx, plan.owner.Address, targetVnodeId); err != nil {
+	if err := m.streamSnapshot(ctx, plan); err != nil {
 		return err
 	}
 
-	if err := m.completeTransferWithRetry(ctx, plan.owner.Address, targetVnodeId); err != nil {
+	if err := m.completeTransferWithRetry(ctx, plan); err != nil {
 		return err
 	}
 
-	if err := m.activateTargetRange(ctx, self.NodeId, targetVnodeId, vnodePos); err != nil {
-		return fmt.Errorf("persist vnode %s active: %w", targetVnodeId, err)
+	if err := m.activateTargetRange(ctx, m.mgr.SelfId(), vnode.Id, vnode.Position); err != nil {
+		return err
 	}
 
-	slog.Info(
-		"claimed target range",
-		"targetVnodeId", targetVnodeId,
-		"from", plan.owner.NodeId,
-		"sourceVnodeId", plan.sourceVnodeId,
-		"start", plan.rangeStart,
-		"end", plan.rangeEnd,
-	)
 	return nil
 }
 
-func (m *Manager) localVnodePosition(self membership.Peer, targetVnodeId string) (uint64, error) {
-	for _, vn := range self.Vnodes {
-		if vn.Id == targetVnodeId {
-			return vn.Position, nil
-		}
-	}
-	return 0, fmt.Errorf("transfer: unknown local vnode %s", targetVnodeId)
-}
+// Returns an accepted transfer plan. Retires on error until
+// accepted or failure
+func (m *Manager) acquireAcceptedTransferPlan(ctx context.Context, vnode membership.Vnode) (rangeTransferPlan, error) {
+	var plan rangeTransferPlan
 
-// requestTransferWithBackoff retries transfer request with exponential backoff,
-// recomputing current owner each attempt to reflect topology changes.
-func (m *Manager) requestTransferWithBackoff(ctx context.Context, selfId, targetVnodeId string, vnodePos uint64) (*targetRangePlan, bool, error) {
-	var (
-		planned  *targetRangePlan
-		accepted bool
-	)
-
-	if err := util.Do(ctx, util.TransferBackoff, func() error {
-		resolvedPlan, resolved := m.currentOwnerRangeForTarget(vnodePos, selfId)
-		if !resolved {
-			accepted = true
-			planned = nil
-			return nil
-		}
-
-		planned = resolvedPlan
-		client, err := m.mgr.TransferClient(ctx, planned.owner.Address)
+	err := util.Do(ctx, util.TransferBackoff, func() error {
+		// Compute the most current plan.
+		computedPlan, err := m.computeRangeTransferPlan(vnode)
 		if err != nil {
 			return err
 		}
-		resp, err := client.RequestRangeTransfer(ctx, &pb.RequestRangeTransferRequest{TargetVnodeId: targetVnodeId, Requestor: selfId})
+		plan = computedPlan
+
+		// Get the owner's address
+		peer, success := m.mgr.PeerById(plan.OwnerNodeID)
+		if !success {
+			return fmt.Errorf("owner peer %s not found", plan.OwnerNodeID)
+		}
+		plan.OwnerAddr = peer.Address
+
+		client, err := m.mgr.TransferClient(ctx, peer.Address)
+		if err != nil {
+			return err
+		}
+		resp, err := client.RequestRangeTransfer(ctx, &pb.RequestRangeTransferRequest{
+			TargetRange: &pb.Range{
+				Start: plan.Range.Start,
+				End:   plan.Range.End,
+			},
+			TransferId: plan.TransferID,
+			Requestor:  m.mgr.SelfId(),
+		})
 		if err != nil {
 			return err
 		}
 		if !resp.Accepted {
 			return errors.New("transfer request rejected")
 		}
-		accepted = true
+
 		return nil
-	}); err != nil {
-		return nil, false, fmt.Errorf("transfer request %s: %w", targetVnodeId, err)
-	}
-	if !accepted {
-		return nil, false, fmt.Errorf("transfer request %s not accepted", targetVnodeId)
-	}
-	if planned == nil {
-		return nil, false, nil
-	}
-	return planned, true, nil
+	})
+
+	return plan, err
 }
 
-func (m *Manager) streamSnapshot(ctx context.Context, ownerAddr, targetVnodeId string) error {
-	client, err := m.mgr.TransferClient(ctx, ownerAddr)
+type rangeTransferPlan struct {
+	TransferID    string
+	StreamID      int32
+	OwnerNodeID   string
+	OwnerAddr     string
+	OwnerVnodeID  string
+	TargetVnodeID string
+	Range         ring.OwnedRange
+}
+
+func (m *Manager) computeRangeTransferPlan(vnode membership.Vnode) (rangeTransferPlan, error) {
+	owner, rangeStart, success := m.currentOwnerForPosition(vnode.Position)
+	if !success {
+		// No current owner, error
+		return rangeTransferPlan{}, fmt.Errorf("no current owner found for vnode %s", vnode.Id)
+	}
+
+	if owner.NodeId == m.mgr.SelfId() {
+		// Self is already the owner, error
+		return rangeTransferPlan{}, fmt.Errorf("self is already owner of vnode %s", vnode.Id)
+	}
+
+	transferID := transferKey(owner.Id, rangeStart, vnode.Position)
+
+	// Return plan
+	return rangeTransferPlan{
+		TransferID:    transferID,
+		StreamID:      streamIDForTransfer(transferID),
+		OwnerNodeID:   owner.NodeId,
+		OwnerVnodeID:  owner.Id,
+		TargetVnodeID: vnode.Id,
+		Range: ring.OwnedRange{
+			VnodeId: vnode.Id,
+			Start:   rangeStart,
+			End:     vnode.Position,
+			NodeId:  m.mgr.SelfId(),
+		},
+	}, nil
+}
+
+func (m *Manager) currentOwnerForPosition(pos uint64) (ring.VnodeEntry, uint64, bool) {
+	behind, ahead, success := m.mgr.Ring.GetVnodesBetweenPosition(pos)
+	if !success {
+		return ring.VnodeEntry{}, 0, false
+	}
+	return ahead, behind.Position, true
+}
+
+func (m *Manager) streamSnapshot(ctx context.Context, plan rangeTransferPlan) error {
+	client, err := m.mgr.TransferClient(ctx, plan.OwnerAddr)
 	if err != nil {
 		return err
 	}
-	stream, err := client.StreamRange(ctx, &pb.StreamRangeRequest{TargetVnodeId: targetVnodeId})
+	stream, err := client.StreamRange(ctx, &pb.StreamRangeRequest{TransferId: plan.StreamID})
 	if err != nil {
-		return fmt.Errorf("stream slice %s: %w", targetVnodeId, err)
+		return fmt.Errorf("stream range %s: %w", plan.TransferID, err)
 	}
 
 	for {
@@ -211,34 +193,37 @@ func (m *Manager) streamSnapshot(ctx context.Context, ownerAddr, targetVnodeId s
 			break
 		}
 		if err != nil {
-			return fmt.Errorf("stream recv %s: %w", targetVnodeId, err)
+			return fmt.Errorf("stream recv %s: %w", plan.TransferID, err)
+		}
+		if chunk.TransferId != plan.TransferID {
+			return fmt.Errorf("streamed transfer mismatch: expected %s, got %s", plan.TransferID, chunk.TransferId)
 		}
 		for _, rec := range chunk.Records {
 			_, err := m.store.UpsertRecord(storage.Record{
 				Key:       rec.Key,
 				Value:     rec.Value,
-				VnodeId:   targetVnodeId,
+				VnodeId:   plan.TargetVnodeID,
 				Timestamp: rec.Timestamp,
 			})
 			if err != nil {
 				return fmt.Errorf("apply streamed record %s: %w", rec.Key, err)
 			}
 		}
-		if chunk.Final {
+		if chunk.IsFinal {
 			break
 		}
 	}
 	return nil
 }
 
-func (m *Manager) completeTransferWithRetry(ctx context.Context, ownerAddr, targetVnodeId string) error {
-	client, err := m.mgr.TransferClient(ctx, ownerAddr)
+func (m *Manager) completeTransferWithRetry(ctx context.Context, plan rangeTransferPlan) error {
+	client, err := m.mgr.TransferClient(ctx, plan.OwnerAddr)
 	if err != nil {
 		return err
 	}
 
 	if err := util.Do(ctx, util.TransferComplete, func() error {
-		resp, err := client.CompleteRangeTransfer(ctx, &pb.CompleteRangeTransferRequest{TargetVnodeId: targetVnodeId})
+		resp, err := client.CompleteRangeTransfer(ctx, &pb.CompleteRangeTransferRequest{TransferId: plan.TransferID})
 		if err != nil {
 			return err
 		}
@@ -247,7 +232,7 @@ func (m *Manager) completeTransferWithRetry(ctx context.Context, ownerAddr, targ
 		}
 		return nil
 	}); err != nil {
-		return fmt.Errorf("complete transfer %s: %w", targetVnodeId, err)
+		return fmt.Errorf("complete transfer %s: %w", plan.TransferID, err)
 	}
 	return nil
 }
@@ -255,49 +240,4 @@ func (m *Manager) completeTransferWithRetry(ctx context.Context, ownerAddr, targ
 type ownerCandidate struct {
 	entry   ring.VnodeEntry
 	vnodeId string
-}
-
-// currentOwnerRangeForTarget finds the current owner and transfer sub-range for
-// a target vnode position being activated. Returned range is (start, end].
-func (m *Manager) currentOwnerRangeForTarget(position uint64, excludeNodeId string) (*targetRangePlan, bool) {
-	candidates := make([]ownerCandidate, 0)
-	for _, peer := range m.mgr.AllMembers() {
-		if peer.State == membership.PeerDown || peer.NodeId == excludeNodeId {
-			continue
-		}
-		for _, vn := range peer.Vnodes {
-			if vn.State != membership.VnodeActive {
-				continue
-			}
-			candidates = append(candidates, ownerCandidate{
-				entry:   ring.VnodeEntry{Position: vn.Position, NodeId: peer.NodeId, Address: peer.Address},
-				vnodeId: vn.Id,
-			})
-		}
-	}
-
-	if len(candidates) == 0 {
-		return nil, false
-	}
-
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].entry.Position < candidates[j].entry.Position
-	})
-
-	idx := sort.Search(len(candidates), func(i int) bool {
-		return candidates[i].entry.Position >= position
-	})
-	if idx == len(candidates) {
-		idx = 0
-	}
-
-	owner := candidates[idx]
-	prev := candidates[(idx-1+len(candidates))%len(candidates)]
-
-	return &targetRangePlan{
-		owner:         owner.entry,
-		sourceVnodeId: owner.vnodeId,
-		rangeStart:    prev.entry.Position,
-		rangeEnd:      position,
-	}, true
 }

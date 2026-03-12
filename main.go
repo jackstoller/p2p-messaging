@@ -88,9 +88,6 @@ func run(cfg config.NodeConfig) error {
 }
 
 func claimPrimaryVirtualNodes(ctx context.Context, cfg config.NodeConfig, xfer *transfer.Manager) error {
-	if err := xfer.RecoverOwnedVnodes(ctx); err != nil {
-		return fmt.Errorf("recover owned vnodes: %w", err)
-	}
 	if len(cfg.BootstrapPeers) == 0 {
 		return nil
 	}

@@ -29,7 +29,7 @@ const (
 type Vnode struct {
 	Id       string
 	Position uint64
-	State    VnodeState // TODO: Remove?
+	State    VnodeState
 }
 
 // Peer is a known physical node in the mesh.
@@ -44,9 +44,9 @@ func (p Peer) GetNodeId() string { return p.NodeId }
 
 // Manager owns membership state, routing ring, and outbound client cache.
 type Manager struct {
-	mu      sync.RWMutex
-	selfId  string
-	members map[string]*Peer // includes self
+	mu           sync.RWMutex
+	selfId       string
+	members      map[string]*Peer // includes self
 
 	Ring *ring.Ring
 

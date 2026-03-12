@@ -7,6 +7,9 @@ version: "3.9"
 # Run:
 #   docker compose up --build
 #
+# Optional host debugging access for node1 is published on port 19001 by default.
+# Override with NODE1_DEBUG_PORT if needed.
+#
 # Bring a node down to test crash recovery:
 #   docker compose stop node2
 
@@ -28,7 +31,7 @@ services:
     networks:
       - mesh
     ports:
-      - "9001:9000"   # expose for debugging; not required internally
+      - "${NODE1_DEBUG_PORT:-19001}:9000"   # expose for debugging; not required internally
 
   node2:
     build: .

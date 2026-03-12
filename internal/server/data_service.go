@@ -29,10 +29,16 @@ func (s *Server) Write(ctx context.Context, req *pb.WriteRequest) (*pb.WriteResp
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
+	if err := s.xfer.RejectPrimaryWrite(vnodeId, req.Key); err != nil {
+		return nil, status.Error(codes.Unavailable, err.Error())
+	}
 
 	rec := storage.Record{Key: req.Key, Value: req.Value, VnodeId: vnodeId, Timestamp: timestamp} // TODO: Why store vnode id over position?
 	if _, err := s.store.UpsertRecord(rec); err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
+	}
+	if err := s.xfer.ForwardPrimaryWrite(ctx, vnodeId, rec); err != nil {
+		return nil, status.Error(codes.Unavailable, err.Error())
 	}
 
 	// Step 4 continue async replica fanout after ACK

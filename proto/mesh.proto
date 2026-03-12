@@ -37,6 +37,12 @@ message Member {
   PeerState            state   = 4;
 }
 
+// Range describes a interval of the hash ring
+message Range {
+  uint64 start = 2; // inclusive
+  uint64 end   = 3; // exclusive
+}
+
 // DataRecord is a stored key/value pair with a timestamp for last-write-wins
 // conflict resolution. The timestamp is set by the primary on write.
 message DataRecord {
@@ -45,8 +51,7 @@ message DataRecord {
   int64  timestamp = 3; // unix millis
 }
 
-// MembershipService
-
+// MembershipService manages node discovery, liveness checks, and membership broadcasts.
 service MembershipService {
   // New node to bootstrap. "I exist, add me to the mesh." TODO Is this step necessary?
   rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
@@ -65,9 +70,11 @@ service MembershipService {
 }
 
 message RegisterNodeRequest  { Member member = 1; }
+
 message RegisterNodeResponse { bool   accepted = 1; }
 
 message ListNodesRequest     { string requesting_node_id = 1; }
+
 message ListNodesResponse    { repeated Member members   = 1; }
 
 // NodeStatusRequest carries a PEER_UP announcement (with vnodes) or a
@@ -77,17 +84,18 @@ message NodeStatusRequest {
   PeerState            state   = 2;
   repeated VirtualNode vnodes  = 3; // TODO: make optional?
 }
+
 message NodeStatusResponse {}
 
 message PingRequest  { string node_id = 1; } // TODO: add timestamps for latency
+
 message PingResponse { string node_id = 1; }
 
 message ConfirmSuspectRequest  { string suspect_node_id = 1; }
+
 message ConfirmSuspectResponse { bool   confirmed       = 1; }
 
-// TransferService
-// Handles range handoff when a joining vnode activates. (Phase 2)
-
+// TransferService handles range handoff when a joining vnode activates. (Phase 2)
 service TransferService {
   // Joiner to current owner. "I claim my target range, begin handoff."
   rpc RequestRangeTransfer(RequestRangeTransferRequest) returns (RequestRangeTransferResponse);
@@ -102,42 +110,46 @@ service TransferService {
   rpc CompleteRangeTransfer(CompleteRangeTransferRequest) returns (CompleteRangeTransferResponse);
 
   // New owner to all nodes. Target vnode is now ACTIVE and serves its range.
-  rpc RangeStatusUpdate(RangeStatusUpdateRequest) returns (RangeStatusUpdateResponse);
+  rpc VNodeStatusUpdate(VNodeStatusUpdateRequest) returns (VNodeStatusUpdateResponse);
 }
 
 message RequestRangeTransferRequest {
-  string target_vnode_id  = 1;
-  string requestor = 2;
+  Range  target_range = 1;
+  string transfer_id  = 2;
+  string requestor    = 3;
 }
+
 message RequestRangeTransferResponse { bool accepted = 1; }
 
-message StreamRangeRequest { string target_vnode_id = 1; }
+message StreamRangeRequest { int32 transfer_id = 1; }
+
 message RangeDataChunk {
-  string              target_vnode_id = 1;
-  int32               seq      = 2;
-  bool                final    = 3;
-  repeated DataRecord records  = 4;
+  string              transfer_id  = 1;
+  int32               seq          = 2;
+  bool                is_final     = 3;
+  repeated DataRecord records      = 4;
 }
 
 message ForwardWriteRequest {
   string     write_id = 1;
   DataRecord record   = 2;
 }
+
 message ForwardWriteResponse { string write_id = 1; }
 
-message CompleteRangeTransferRequest  { string target_vnode_id = 1; }
+message CompleteRangeTransferRequest  { string transfer_id = 1; }
+
 message CompleteRangeTransferResponse { bool   accepted = 1; }
 
-message RangeStatusUpdateRequest {
+message VNodeStatusUpdateRequest {
   string     target_vnode_id = 1;
-  string     owner_id = 2;
-  VnodeState state    = 3;
+  string     node_id         = 2;
+  VnodeState state           = 3;
 }
-message RangeStatusUpdateResponse {}
 
-// ReplicaService
-// Handles replication and replica repair after topology changes. (Phase 3)
+message VNodeStatusUpdateResponse {} 
 
+// ReplicaService handles replication and replica repair after topology changes. (Phase 3)
 service ReplicaService {
   // Primary to replica. Update rank and primary identity.
   rpc UpdateReplicaRank(UpdateReplicaRankRequest) returns (UpdateReplicaRankResponse);
@@ -151,19 +163,21 @@ message UpdateReplicaRankRequest {
   string primary_id = 2;
   int32  new_rank   = 3;
 }
+
 message UpdateReplicaRankResponse {}
 
 message CreateReplicaRequest {
   string     vnode_id = 1;
   DataRecord record   = 2;
 }
+
 message CreateReplicaResponse { bool ack = 1; }
 
-// DataService
-// External-facing read/write interface routed to the primary. (Phase 3)
-
+// DataService is the external-facing read/write interface routed to the primary. (Phase 3)
 service DataService {
+  // Write stores a key/value pair on the current primary and returns the write timestamp.
   rpc Write(WriteRequest) returns (WriteResponse);
+  // Read fetches the latest value for a key from the primary or a replica fallback.
   rpc Read(ReadRequest)   returns (ReadResponse);
 }
 
@@ -171,12 +185,14 @@ message WriteRequest {
   string key   = 1;
   bytes  value = 2;
 }
+
 message WriteResponse {
   bool  ok        = 1;
   int64 timestamp = 2;
 }
 
 message ReadRequest  { string key = 1; }
+
 message ReadResponse {
   bytes value = 1;
   bool  found = 2;

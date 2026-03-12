@@ -15,6 +15,7 @@ const DefaultVnodeCount = 5
 // The ring only ever holds entries for ACTIVE vnodes; the membership layer
 // is responsible for filtering before calling Rebuild.
 type VnodeEntry struct {
+	Id       string
 	Position uint64
 	NodeId   string
 	Address  string
@@ -105,6 +106,22 @@ func (r *Ring) ResponsibleNodes(key string, n int) []VnodeEntry {
 		}
 	}
 	return result
+}
+
+// Returns the Vnodes behind and in-front of the position. If no vnodes exist, returns false.
+func (r *Ring) GetVnodesBetweenPosition(pos uint64) (VnodeEntry, VnodeEntry, bool) {
+	r.mu.RLock()
+	pts := r.points
+	r.mu.RUnlock()
+
+	if len(r.points) == 0 {
+		return VnodeEntry{}, VnodeEntry{}, false
+	}
+
+	idx := sort.Search(len(pts), func(i int) bool { return r.points[i].Position >= pos })
+	prev := r.points[(idx-1+len(pts))%len(pts)]
+
+	return prev, r.points[idx%len(pts)], true
 }
 
 // Predecessor returns the nearest distinct physical node counterclockwise from
