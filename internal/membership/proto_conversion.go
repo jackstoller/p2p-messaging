@@ -43,21 +43,3 @@ func vnodesProto(nodeId, address string, vnodes []Vnode) []*pb.VirtualNode {
 	}
 	return result
 }
-
-// mergeVnodes preserves known ACTIVE state to avoid stale DOWNGRADE updates.
-// TODO: Could this be removed?
-func mergeVnodes(existing, incoming []Vnode) []Vnode {
-	existingById := make(map[string]VnodeState, len(existing))
-	for _, vn := range existing {
-		existingById[vn.Id] = vn.State
-	}
-
-	merged := make([]Vnode, len(incoming))
-	for i, vn := range incoming {
-		if prior, ok := existingById[vn.Id]; ok && prior == VnodeActive {
-			vn.State = VnodeActive
-		}
-		merged[i] = vn
-	}
-	return merged
-}

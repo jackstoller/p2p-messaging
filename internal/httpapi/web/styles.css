@@ -1,0 +1,362 @@
+:root {
+    --bg: #efe8dd;
+    --panel: rgba(255, 251, 246, 0.92);
+    --panel-strong: #fffaf4;
+    --ink: #211b17;
+    --muted: #73685d;
+    --line: rgba(33, 27, 23, 0.1);
+    --accent: #cb5a3a;
+    --accent-deep: #9f3e24;
+    --danger: #a02e2e;
+    --success: #28835d;
+    --shadow: 0 24px 70px rgba(67, 43, 25, 0.14);
+    --radius: 28px;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    min-height: 100vh;
+    font-family: "Avenir Next", "Segoe UI", sans-serif;
+    color: var(--ink);
+    background:
+        radial-gradient(circle at 0% 0%, rgba(203, 90, 58, 0.2), transparent 25%),
+        radial-gradient(circle at 100% 100%, rgba(40, 131, 93, 0.14), transparent 30%),
+        linear-gradient(160deg, #f6f1ea, var(--bg));
+}
+
+.hidden {
+    display: none !important;
+}
+
+.eyebrow {
+    margin: 0 0 8px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    font-size: 0.76rem;
+}
+
+.hint,
+.lede {
+    color: var(--muted);
+}
+
+.auth-screen {
+    min-height: 100vh;
+    display: grid;
+    place-items: center;
+    padding: 20px;
+}
+
+.auth-card,
+.card,
+.fingerprint-card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    backdrop-filter: blur(10px);
+}
+
+.auth-card {
+    width: min(520px, 100%);
+    padding: 36px;
+}
+
+.auth-card h1,
+.sidebar h2,
+.chat-head h2,
+.profile-panel h3,
+.fingerprint-card h3 {
+    margin: 0;
+    font-family: Georgia, "Times New Roman", serif;
+}
+
+label {
+    display: block;
+    margin: 18px 0 8px;
+    font-size: 0.95rem;
+}
+
+input,
+textarea,
+button {
+    width: 100%;
+    font: inherit;
+    border-radius: 20px;
+    border: 1px solid rgba(33, 27, 23, 0.14);
+}
+
+input,
+textarea {
+    padding: 14px 16px;
+    background: rgba(255, 255, 255, 0.75);
+    color: var(--ink);
+}
+
+button {
+    padding: 14px 16px;
+    cursor: pointer;
+    background: linear-gradient(135deg, var(--accent), var(--accent-deep));
+    color: white;
+}
+
+button.ghost {
+    background: rgba(255, 255, 255, 0.78);
+    color: var(--ink);
+}
+
+button.danger {
+    background: linear-gradient(135deg, #c04242, var(--danger));
+}
+
+button.small {
+    width: auto;
+    padding: 10px 14px;
+}
+
+.app-shell {
+    min-height: 100vh;
+    display: grid;
+    grid-template-columns: 360px minmax(0, 1fr);
+    gap: 18px;
+    padding: 18px;
+}
+
+.card {
+    padding: 22px;
+}
+
+.sidebar {
+    display: flex;
+    flex-direction: column;
+    min-height: calc(100vh - 36px);
+}
+
+.sidebar-head,
+.chat-head,
+.profile-panel,
+.composer-row,
+.inline-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.sidebar-head,
+.chat-head {
+    justify-content: space-between;
+}
+
+.sidebar-meta {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    margin: 8px 0 18px;
+    color: var(--muted);
+    font-size: 0.92rem;
+}
+
+.conversation-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    overflow-y: auto;
+}
+
+.conversation-item {
+    width: 100%;
+    text-align: left;
+    background: rgba(255, 255, 255, 0.72);
+    color: var(--ink);
+    padding: 14px 16px;
+}
+
+.conversation-item.active {
+    border-color: rgba(203, 90, 58, 0.35);
+    background: rgba(203, 90, 58, 0.12);
+}
+
+.conversation-name,
+.conversation-preview {
+    display: block;
+}
+
+.conversation-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+}
+
+.conversation-preview,
+.conversation-time,
+.chat-subtle {
+    color: var(--muted);
+    font-size: 0.9rem;
+}
+
+.chat-pane {
+    display: flex;
+    flex-direction: column;
+    min-height: calc(100vh - 36px);
+    background: linear-gradient(180deg, rgba(255, 250, 244, 0.96), rgba(255, 247, 238, 0.92));
+}
+
+.chat-identity {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.status-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 999px;
+    background: #c5b9ae;
+    box-shadow: 0 0 0 5px rgba(197, 185, 174, 0.18);
+}
+
+.status-dot.online {
+    background: var(--success);
+    box-shadow: 0 0 0 5px rgba(40, 131, 93, 0.18);
+}
+
+.inline-panel {
+    margin: 18px 0 10px;
+    padding: 16px;
+    border-radius: 22px;
+    background: rgba(255, 255, 255, 0.68);
+    border: 1px solid var(--line);
+}
+
+.inline-row input {
+    flex: 1;
+}
+
+.messages {
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 18px 0;
+}
+
+.message {
+    max-width: min(72%, 680px);
+    padding: 12px 14px;
+    border-radius: 22px;
+    background: var(--panel-strong);
+    border: 1px solid var(--line);
+}
+
+.message.outgoing {
+    align-self: flex-end;
+    background: rgba(203, 90, 58, 0.12);
+}
+
+.message-meta {
+    margin-top: 6px;
+    color: var(--muted);
+    font-size: 0.84rem;
+}
+
+.empty-state {
+    margin: auto 0;
+    text-align: center;
+    color: var(--muted);
+}
+
+.composer {
+    padding-top: 6px;
+}
+
+.composer textarea {
+    resize: none;
+}
+
+.composer-row {
+    justify-content: flex-end;
+    margin-top: 12px;
+}
+
+.profile-panel {
+    justify-content: space-between;
+    padding-top: 18px;
+    margin-top: 12px;
+    border-top: 1px solid var(--line);
+}
+
+.profile-actions {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+
+.fingerprint-dialog {
+    border: none;
+    background: transparent;
+    padding: 20px;
+}
+
+.fingerprint-dialog::backdrop {
+    background: rgba(23, 18, 14, 0.38);
+}
+
+.fingerprint-card {
+    width: min(420px, calc(100vw - 32px));
+    padding: 28px;
+}
+
+.toast {
+    position: fixed;
+    right: 18px;
+    bottom: 18px;
+    max-width: 320px;
+    padding: 14px 16px;
+    border-radius: 18px;
+    background: rgba(33, 27, 23, 0.92);
+    color: white;
+    box-shadow: var(--shadow);
+}
+
+.toast.error {
+    background: rgba(160, 46, 46, 0.96);
+}
+
+.toast.success {
+    background: rgba(40, 131, 93, 0.96);
+}
+
+.mobile-only {
+    display: none;
+}
+
+@media (max-width: 920px) {
+    .app-shell {
+        grid-template-columns: 1fr;
+        padding: 0;
+        gap: 0;
+    }
+
+    .sidebar,
+    .chat-pane {
+        min-height: 100vh;
+        border-radius: 0;
+    }
+
+    .sidebar.hidden-mobile,
+    .chat-pane.hidden-mobile {
+        display: none;
+    }
+
+    .mobile-only {
+        display: inline-flex;
+    }
+}

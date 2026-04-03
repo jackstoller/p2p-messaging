@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	"github.com/jackstoller/p2p-messaging/internal/logging"
 )
 
 // Config defines retry behaviour for a specific call site.
@@ -27,6 +29,10 @@ var (
 	// TransferBackoff retries forever with exponential delay up to 30 minutes.
 	TransferBackoff = Config{MaxAttempts: -1, InitialDelay: 1 * time.Second, Multiplier: 2.0, MaxDelay: 30 * time.Minute}
 
+	// RangeClaimBackoff retries forever but stays responsive to topology churn.
+	// Claim rejections are often transient while neighboring vnodes complete.
+	RangeClaimBackoff = Config{MaxAttempts: -1, InitialDelay: 250 * time.Millisecond, Multiplier: 1.5, MaxDelay: 1 * time.Minute}
+
 	// TransferComplete runs 5 attempts, 500 milliseconds apart.
 	TransferComplete = Config{MaxAttempts: 5, InitialDelay: 500 * time.Millisecond, Multiplier: 1.0}
 
@@ -39,13 +45,20 @@ var (
 // fn should be idempotent. ctx cancellation is checked between attempts only;
 // long-running fn bodies should accept and honour the ctx themselves.
 func Do(ctx context.Context, cfg Config, fn func() error) error {
+	log := logging.Component("util.retry")
 	delay := cfg.InitialDelay
 	var lastErr error
 
 	for attempt := 0; cfg.MaxAttempts < 0 || attempt < cfg.MaxAttempts; attempt++ {
+		attemptNumber := attempt + 1
+		log.Debug("retry.attempt", logging.Outcome(logging.OutcomeStarted), "attempt", attemptNumber, "max_attempts", cfg.MaxAttempts)
 		if lastErr = fn(); lastErr == nil {
+			if attemptNumber > 1 {
+				log.Info("retry.complete", logging.Outcome(logging.OutcomeSucceeded), "attempt", attemptNumber)
+			}
 			return nil
 		}
+		log.Warn("retry.attempt", logging.Outcome(logging.OutcomeFailed), "attempt", attemptNumber, "max_attempts", cfg.MaxAttempts, logging.Err(lastErr))
 
 		// Don't wait after the final attempt.
 		isLastAttempt := cfg.MaxAttempts > 0 && attempt == cfg.MaxAttempts-1
@@ -55,8 +68,10 @@ func Do(ctx context.Context, cfg Config, fn func() error) error {
 
 		select {
 		case <-ctx.Done():
+			log.Warn("retry.cancelled", logging.Outcome(logging.OutcomeFailed), "attempt", attemptNumber, logging.Err(ctx.Err()))
 			return ctx.Err()
 		case <-time.After(delay):
+			log.Debug("retry.wait.complete", logging.Outcome(logging.OutcomeSucceeded), "attempt", attemptNumber, logging.DurationMillis("delay", delay))
 		}
 
 		if cfg.Multiplier > 1.0 {
@@ -69,7 +84,9 @@ func Do(ctx context.Context, cfg Config, fn func() error) error {
 	}
 
 	if lastErr != nil {
+		log.Error("retry.exhausted", logging.Outcome(logging.OutcomeFailed), "max_attempts", cfg.MaxAttempts, logging.Err(lastErr))
 		return fmt.Errorf("all %d attempt(s) failed: %w", cfg.MaxAttempts, lastErr)
 	}
+	log.Error("retry.exhausted", logging.Outcome(logging.OutcomeFailed), "max_attempts", cfg.MaxAttempts)
 	return fmt.Errorf("all attempts exhausted")
 }

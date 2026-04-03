@@ -11,10 +11,13 @@ import (
 type NodeConfig struct {
 	NodeId         string
 	ListenAddr     string   // e.g. ":9000" - the gRPC address this node binds to
+	HTTPListenAddr string   // e.g. ":8081" - the user-facing HTTP API address
+	HTTPAdvertise  string   // e.g. "node1:8081" or "https://node1.example.com" - how browsers/nodes should reach this node over HTTP
 	AdvertiseAddr  string   // e.g. "node1:9000" - what peers use to dial this node
 	BootstrapPeers []string // addresses of seed nodes, empty if first in network
 	DBPath         string   // SQLite file path, ":memory:" for in-memory
 	ReplicaCount   int
+	LogLevel       string
 
 	CACertPath   string
 	NodeCertPath string

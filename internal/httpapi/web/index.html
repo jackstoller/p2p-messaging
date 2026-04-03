@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Meshline</title>
+    <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+    <section id="authScreen" class="auth-screen">
+        <div class="auth-card">
+            <p class="eyebrow">Mesh-backed chat</p>
+            <h1>Meshline</h1>
+            <p class="lede">Create a username and jump straight into your conversations. Your recovery secret is generated and cached locally in the browser.</p>
+            <label for="createUsername">Username</label>
+            <input id="createUsername" placeholder="username" autocomplete="username">
+            <button id="createAccountBtn">Create account</button>
+            <p class="hint">If this browser already has cached credentials, you will go directly into the app next time.</p>
+        </div>
+    </section>
+
+    <main id="appShell" class="app-shell hidden">
+        <aside class="sidebar card">
+            <div class="sidebar-head">
+                <div>
+                    <p class="eyebrow">Conversations</p>
+                    <h2 id="sidebarUser">username</h2>
+                </div>
+                <button id="newConversationBtn" class="ghost small">New</button>
+            </div>
+            <div class="sidebar-meta">
+                <span id="sidebarNode">Node unknown</span>
+                <span id="sidebarPresence">Offline</span>
+            </div>
+            <div id="conversationList" class="conversation-list"></div>
+        </aside>
+
+        <section class="chat-pane card">
+            <div class="chat-head">
+                <div>
+                    <button id="backToListBtn" class="ghost small mobile-only">Back</button>
+                    <div class="chat-identity">
+                        <span id="peerStatusDot" class="status-dot"></span>
+                        <h2 id="chatTitle">New conversation</h2>
+                    </div>
+                    <p id="chatSubtitle" class="hint">Pick a conversation or start a new one.</p>
+                </div>
+                <button id="showFingerprintBtn" class="ghost small">Fingerprint</button>
+            </div>
+
+            <div id="newConversationPanel" class="inline-panel">
+                <label for="newConversationInput">Start a new chat</label>
+                <div class="inline-row">
+                    <input id="newConversationInput" placeholder="username">
+                    <button id="connectPeerBtn">Start chat</button>
+                </div>
+            </div>
+
+            <div id="messages" class="messages"></div>
+
+            <div class="composer">
+                <textarea id="messageInput" rows="3" placeholder="Write a message"></textarea>
+                <div class="composer-row">
+                    <button id="sendBtn">Send</button>
+                </div>
+            </div>
+
+            <div class="profile-panel">
+                <div class="profile-copy">
+                    <p class="eyebrow">Profile</p>
+                    <h3 id="profileUsername">username</h3>
+                    <p id="profileNode" class="hint">Connected node unknown</p>
+                </div>
+                <div class="profile-actions">
+                    <button id="refreshNodesBtn" class="ghost small">Refresh node</button>
+                    <button id="deleteAccountBtn" class="danger small">Delete account</button>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <dialog id="fingerprintDialog" class="fingerprint-dialog">
+        <form method="dialog" class="fingerprint-card">
+            <p class="eyebrow">End-to-end fingerprint</p>
+            <h3 id="fingerprintValue">Unavailable</h3>
+            <p class="hint">Verify this value with the other person over a second channel.</p>
+            <button class="ghost">Close</button>
+        </form>
+    </dialog>
+
+    <div id="toast" class="toast hidden"></div>
+    <script src="/app.js" defer></script>
+</body>
+</html>

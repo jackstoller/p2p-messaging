@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mesh Monitor Console</title>
+    <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+    <main class="shell dashboard-shell">
+        <header class="header dashboard-header">
+            <div class="title-wrap">
+                <h1>Mesh Monitor</h1>
+            </div>
+            <nav class="tabs" aria-label="Monitor views">
+                <button class="tab-button active" type="button" data-tab-target="node-details">Nodes</button>
+                <button class="tab-button" type="button" data-tab-target="global-records">Records</button>
+                <button class="tab-button" type="button" data-tab-target="event-feed">Logs</button>
+            </nav>
+        </header>
+
+        <section id="tab-node-details" class="tab-panel active" data-tab-panel="node-details">
+            <section class="node-grid">
+                <article class="panel node-panel">
+                    <div class="panel-head">Nodes</div>
+                    <div id="node-list" class="node-list" aria-live="polite"></div>
+                </article>
+                <article class="panel node-panel">
+                    <div class="panel-head">Details</div>
+                    <div id="node-detail" class="node-detail">
+                        <p class="node-empty">Select a node to inspect ranges and log-derived activity.</p>
+                    </div>
+                </article>
+            </section>
+        </section>
+
+        <section id="tab-global-records" class="tab-panel" data-tab-panel="global-records" hidden>
+            <section class="panel interact-panel">
+                <div class="panel-head">Interact</div>
+                <div class="interact-grid">
+                    <section class="interact-block">
+                        <h3>Write</h3>
+                        <form id="interact-write-form" class="node-form" data-node-action="write-global">
+                            <label for="interact-write-node">Target Node</label>
+                            <select id="interact-write-node"></select>
+                            <label>Write key<input id="interact-write-key" name="key" type="text" placeholder="example-key" required></label>
+                            <label>Write value<textarea id="interact-write-value" name="value" rows="3" placeholder="hello mesh"></textarea></label>
+                            <button class="ops-button" type="submit">Send Write</button>
+                        </form>
+                    </section>
+                    <section class="interact-block">
+                        <h3>Read</h3>
+                        <div class="node-form">
+                            <label for="interact-read-node">Target Node</label>
+                            <select id="interact-read-node"></select>
+                            <div class="read-form">
+                                <label>Read key<input id="interact-read-key" type="text" placeholder="example-key"></label>
+                                <button id="interact-read-button" class="ops-button" type="button">Send Read</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <p id="interact-status" class="node-op-status"></p>
+                <div id="interact-read-result" class="read-result"></div>
+            </section>
+
+            <section class="panel debug-panel">
+                <div class="panel-head">Records</div>
+                <div class="debug-controls">
+                    <label for="record-filter">Filter key</label>
+                    <input id="record-filter" type="text" placeholder="example-key">
+                    <label for="record-health-filter">Health</label>
+                    <select id="record-health-filter">
+                        <option value="all" selected>All</option>
+                        <option value="write">Writes seen</option>
+                        <option value="read-only">Read only</option>
+                    </select>
+                    <button id="refresh-records" type="button">Refresh</button>
+                </div>
+                <div id="record-summary" class="debug-summary">Cluster activity not loaded yet.</div>
+                <div class="debug-table-wrap">
+                    <table class="node-table">
+                        <thead>
+                            <tr><th>Key</th><th>Nodes</th><th>Reads</th><th>Writes</th><th>Latest TS</th><th>Placement</th><th>Observed On</th></tr>
+                        </thead>
+                        <tbody id="record-table-body">
+                            <tr><td colspan="7" class="node-empty-cell">No cluster records loaded yet.</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+        </section>
+
+        <section id="tab-event-feed" class="tab-panel" data-tab-panel="event-feed" hidden>
+            <section class="panel feed-panel">
+                <div class="panel-head">Logs</div>
+                <div class="controls" role="group" aria-label="Log display controls">
+                    <label for="level-filter">Level</label>
+                    <select id="level-filter">
+                        <option value="all" selected>All</option>
+                        <option value="debug">Debug+</option>
+                        <option value="info">Info+</option>
+                        <option value="warn">Warn+</option>
+                        <option value="error">Error only</option>
+                    </select>
+                    <label for="log-search">Search</label>
+                    <input id="log-search" type="text" placeholder="Search message, source, node, or fields">
+                </div>
+                <div id="meta" class="feed-meta">Live logs from all nodes.</div>
+                <ul id="feed-list" class="feed-list" aria-live="polite"></ul>
+            </div>
+        </section>
+    </main>
+    <script src="/app.js" defer></script>
+</body>
+</html>

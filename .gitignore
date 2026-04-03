@@ -3,3 +3,8 @@
 *.key
 
 *.pb.go
+
+# GoLang
+vendor/
+.gomodcache/
+.gocache/

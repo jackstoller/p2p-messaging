@@ -44,14 +44,17 @@ func (p Peer) GetNodeId() string { return p.NodeId }
 
 // Manager owns membership state, routing ring, and outbound client cache.
 type Manager struct {
-	mu           sync.RWMutex
-	selfId       string
-	members      map[string]*Peer // includes self
+	mu      sync.RWMutex
+	selfId  string
+	members map[string]*Peer // includes self
 
 	Ring *ring.Ring
 
 	suspectsMu sync.RWMutex
 	suspects   map[string]struct{}
+
+	heartbeatMu       sync.Mutex
+	heartbeatInFlight map[string]struct{}
 
 	replicaCount int
 	tlsCfg       *tls.Config
