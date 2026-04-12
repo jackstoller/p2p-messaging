@@ -61,7 +61,7 @@ func (m *Manager) pingNode(ctx context.Context, target Peer) {
 	log.Debug("heartbeat.ping", logging.Outcome(logging.OutcomeStarted), logging.AttrPeerId, target.NodeId, logging.AttrPeerAddr, target.Address)
 
 	// Step 1 first ping attempt
-	if m.sendPing(ctx, target) == nil {
+	if m.probePeer(ctx, target) == nil {
 		m.ClearSuspect(target.NodeId)
 		log.Debug("heartbeat.ping", logging.Outcome(logging.OutcomeSucceeded), logging.AttrPeerId, target.NodeId, logging.AttrPeerAddr, target.Address, "attempt", 1)
 		return
@@ -89,7 +89,7 @@ func (m *Manager) pingNode(ctx context.Context, target Peer) {
 			return
 		}
 
-		if m.sendPing(ctx, target) == nil {
+		if m.probePeer(ctx, target) == nil {
 			m.ClearSuspect(target.NodeId)
 			log.Info("heartbeat.recovered", logging.Outcome(logging.OutcomeSucceeded), logging.AttrPeerId, target.NodeId, logging.AttrPeerAddr, target.Address, "attempt", i+2)
 			return
@@ -100,6 +100,74 @@ func (m *Manager) pingNode(ctx context.Context, target Peer) {
 	// Step 3 retries exhausted so gather peer confirmation
 	log.Warn("heartbeat.confirm", logging.Outcome(logging.OutcomeStarted), logging.AttrPeerId, target.NodeId, logging.AttrPeerAddr, target.Address)
 	m.confirmSuspect(ctx, target)
+}
+
+// ConfirmPeerUnreachable actively verifies that the target cannot be reached.
+func (m *Manager) ConfirmPeerUnreachable(ctx context.Context, suspectId string) bool {
+	log := logging.Component("membership.heartbeat")
+	if suspectId == "" || suspectId == m.selfId {
+		log.Debug("heartbeat.confirm.reachability", logging.Outcome(logging.OutcomeSkipped), logging.AttrPeerId, suspectId, "reason", "invalid_target")
+		return false
+	}
+
+	peer, ok := m.PeerById(suspectId)
+	if !ok {
+		log.Debug("heartbeat.confirm.reachability", logging.Outcome(logging.OutcomeSkipped), logging.AttrPeerId, suspectId, "reason", "peer_not_found")
+		return false
+	}
+	if peer.State == PeerDown {
+		log.Debug("heartbeat.confirm.reachability", logging.Outcome(logging.OutcomeSucceeded), logging.AttrPeerId, suspectId, "reason", "already_down")
+		return true
+	}
+	if m.IsSuspect(suspectId) {
+		log.Debug("heartbeat.confirm.reachability", logging.Outcome(logging.OutcomeSucceeded), logging.AttrPeerId, suspectId, "reason", "already_suspect")
+		return true
+	}
+
+	if err := m.probePeer(ctx, peer); err == nil {
+		m.ClearSuspect(suspectId)
+		log.Debug("heartbeat.confirm.reachability", logging.Outcome(logging.OutcomeSkipped), logging.AttrPeerId, suspectId, "reason", "peer_reachable")
+		return false
+	}
+
+	m.MarkSuspect(suspectId)
+	log.Warn("heartbeat.confirm.reachability", logging.Outcome(logging.OutcomeSucceeded), logging.AttrPeerId, suspectId, logging.AttrPeerAddr, peer.Address, "reason", "peer_unreachable")
+	return true
+}
+
+// HandlePeerUnreachable fast-tracks suspect confirmation from any RPC path.
+func (m *Manager) HandlePeerUnreachable(ctx context.Context, nodeId string, cause error) bool {
+	log := logging.Component("membership.heartbeat")
+	if nodeId == "" || nodeId == m.selfId {
+		log.Debug("heartbeat.failure_observed", logging.Outcome(logging.OutcomeSkipped), logging.AttrPeerId, nodeId, "reason", "invalid_target")
+		return false
+	}
+
+	peer, ok := m.PeerById(nodeId)
+	if !ok {
+		log.Debug("heartbeat.failure_observed", logging.Outcome(logging.OutcomeSkipped), logging.AttrPeerId, nodeId, "reason", "peer_not_found")
+		return false
+	}
+	if peer.State == PeerDown {
+		log.Debug("heartbeat.failure_observed", logging.Outcome(logging.OutcomeSkipped), logging.AttrPeerId, nodeId, "reason", "already_down")
+		return true
+	}
+	if !m.beginHeartbeatProbe(nodeId) {
+		log.Debug("heartbeat.failure_observed", logging.Outcome(logging.OutcomeSkipped), logging.AttrPeerId, nodeId, "reason", "probe_inflight")
+		return m.IsDown(nodeId)
+	}
+	defer m.endHeartbeatProbe(nodeId)
+
+	log.Warn("heartbeat.failure_observed", logging.Outcome(logging.OutcomeStarted), logging.AttrPeerId, nodeId, logging.AttrPeerAddr, peer.Address, logging.Err(cause))
+	if err := m.probePeer(ctx, peer); err == nil {
+		m.ClearSuspect(nodeId)
+		log.Info("heartbeat.failure_observed", logging.Outcome(logging.OutcomeSkipped), logging.AttrPeerId, nodeId, logging.AttrPeerAddr, peer.Address, "reason", "peer_reachable_on_recheck")
+		return false
+	}
+
+	m.MarkSuspect(nodeId)
+	m.confirmSuspect(ctx, peer)
+	return m.IsDown(nodeId)
 }
 
 // confirmSuspect asks up to 5 non-suspect active peers whether they can also
@@ -217,6 +285,13 @@ func (m *Manager) declareDown(ctx context.Context, dead Peer) {
 }
 
 // Helper methods
+
+func (m *Manager) probePeer(ctx context.Context, target Peer) error {
+	if m.probePeerFn != nil {
+		return m.probePeerFn(ctx, target)
+	}
+	return m.sendPing(ctx, target)
+}
 
 // sendPing sends one Ping to target with a timeout.
 func (m *Manager) sendPing(ctx context.Context, target Peer) error {

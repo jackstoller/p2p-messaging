@@ -19,6 +19,10 @@ services:
     command: >
       -id=node1
         -listen=:9000
+        -http-listen=:8081
+        -http-advertise=http://localhost:${NODE1_HTTP_PORT:-18081}
+        -stun-listen=:3478
+        -stun-advertise=stun:localhost:${NODE1_STUN_PORT:-34781}
         -advertise=node1:9000
         -db=/data/node1.db
         -replicas=2
@@ -33,12 +37,17 @@ services:
     ports:
       - "${NODE1_DEBUG_PORT:-19001}:9000"   # expose for debugging; not required internally
       - "${NODE1_HTTP_PORT:-18081}:8081"
+      - "${NODE1_STUN_PORT:-34781}:3478/udp"
 
   node2:
     build: .
     command: >
       -id=node2
         -listen=:9000
+        -http-listen=:8081
+        -http-advertise=http://localhost:${NODE2_HTTP_PORT:-18082}
+        -stun-listen=:3478
+        -stun-advertise=stun:localhost:${NODE2_STUN_PORT:-34782}
         -advertise=node2:9000
         -peers=node1:9000
         -db=/data/node2.db
@@ -53,6 +62,7 @@ services:
       - mesh
     ports:
       - "${NODE2_HTTP_PORT:-18082}:8081"
+      - "${NODE2_STUN_PORT:-34782}:3478/udp"
     depends_on:
       - node1
 
@@ -61,6 +71,10 @@ services:
     command: >
       -id=node3
         -listen=:9000
+        -http-listen=:8081
+        -http-advertise=http://localhost:${NODE3_HTTP_PORT:-18083}
+        -stun-listen=:3478
+        -stun-advertise=stun:localhost:${NODE3_STUN_PORT:-34783}
         -advertise=node3:9000
         -peers=node1:9000
         -db=/data/node3.db
@@ -75,6 +89,7 @@ services:
       - mesh
     ports:
       - "${NODE3_HTTP_PORT:-18083}:8081"
+      - "${NODE3_STUN_PORT:-34783}:3478/udp"
     depends_on:
       - node1
 

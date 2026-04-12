@@ -23,7 +23,33 @@ func (s *Server) Write(ctx context.Context, req *pb.WriteRequest) (*pb.WriteResp
 
 	if !plan.local {
 		log.Info("rpc.data.write.forward", logging.Outcome(logging.OutcomeStarted), logging.AttrKey, req.Key, "primary_node_id", plan.primaryNodeId)
-		return s.forwardWriteToPrimary(ctx, plan.primaryNodeId, req)
+		resp, err := s.forwardWriteToPrimary(ctx, plan.primaryNodeId, req)
+		if err == nil {
+			return resp, nil
+		}
+
+		retryPlan, ok := s.failoverWritePlan(ctx, req.Key, plan.primaryNodeId, err)
+		if !ok {
+			return nil, err
+		}
+
+		log.Warn("rpc.data.write.failover", logging.Outcome(logging.OutcomeStarted), logging.AttrKey, req.Key, "failed_primary_id", plan.primaryNodeId, "new_primary_id", retryPlan.primaryNodeId)
+		if retryPlan.local {
+			result, retryErr := s.executeLocalWrite(ctx, req, retryPlan)
+			if retryErr != nil {
+				return nil, retryErr
+			}
+			s.replicateLocalWrite(result)
+			log.Info("rpc.data.write.failover", logging.Outcome(logging.OutcomeSucceeded), logging.AttrKey, req.Key, "new_primary_id", retryPlan.primaryNodeId, logging.AttrVnodeId, result.vnodeId, "timestamp", result.record.Timestamp)
+			return result.response, nil
+		}
+
+		resp, retryErr := s.forwardWriteToPrimary(ctx, retryPlan.primaryNodeId, req)
+		if retryErr != nil {
+			return nil, retryErr
+		}
+		log.Info("rpc.data.write.failover", logging.Outcome(logging.OutcomeSucceeded), logging.AttrKey, req.Key, "new_primary_id", retryPlan.primaryNodeId, "timestamp", resp.GetTimestamp())
+		return resp, nil
 	}
 
 	result, err := s.executeLocalWrite(ctx, req, plan)
@@ -122,6 +148,7 @@ func (s *Server) readRemoteWithRetry(ctx context.Context, nodeId string, req *pb
 		return err
 	})
 	if err != nil {
+		s.mgr.HandlePeerUnreachable(context.Background(), nodeId, err)
 		log.Warn("rpc.data.read.forward", logging.Outcome(logging.OutcomeFailed), logging.AttrKey, req.Key, logging.AttrPeerId, nodeId, logging.AttrPeerAddr, address, "attempts", attempts, logging.Err(err))
 		return nil, err
 	}

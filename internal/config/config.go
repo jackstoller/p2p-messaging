@@ -13,6 +13,8 @@ type NodeConfig struct {
 	ListenAddr     string   // e.g. ":9000" - the gRPC address this node binds to
 	HTTPListenAddr string   // e.g. ":8081" - the user-facing HTTP API address
 	HTTPAdvertise  string   // e.g. "node1:8081" or "https://node1.example.com" - how browsers/nodes should reach this node over HTTP
+	STUNListenAddr string   // e.g. ":3478" - UDP bind address for STUN
+	STUNAdvertise  string   // e.g. "stun:node1.example.com:3478" - how browsers should reach this node's STUN service
 	AdvertiseAddr  string   // e.g. "node1:9000" - what peers use to dial this node
 	BootstrapPeers []string // addresses of seed nodes, empty if first in network
 	DBPath         string   // SQLite file path, ":memory:" for in-memory

@@ -60,9 +60,9 @@ func (s *Server) Ping(_ context.Context, _ *pb.PingRequest) (*pb.PingResponse, e
 	return &pb.PingResponse{NodeId: s.mgr.Self().NodeId}, nil
 }
 
-// ConfirmSuspect returns whether this node currently suspects the target.
-func (s *Server) ConfirmSuspect(_ context.Context, req *pb.ConfirmSuspectRequest) (*pb.ConfirmSuspectResponse, error) {
-	confirmed := s.mgr.IsSuspect(req.SuspectNodeId)
+// ConfirmSuspect returns whether this node can also verify the target is unreachable.
+func (s *Server) ConfirmSuspect(ctx context.Context, req *pb.ConfirmSuspectRequest) (*pb.ConfirmSuspectResponse, error) {
+	confirmed := s.mgr.ConfirmPeerUnreachable(ctx, req.SuspectNodeId)
 	logging.Component("server.membership").Info("rpc.membership.confirm_suspect", logging.Outcome(logging.OutcomeSucceeded), "suspect_id", req.SuspectNodeId, "confirmed", confirmed)
 	return &pb.ConfirmSuspectResponse{Confirmed: confirmed}, nil
 }

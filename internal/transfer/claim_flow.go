@@ -169,6 +169,7 @@ func (m *Manager) acquireAcceptedTransferPlan(ctx context.Context, vnode members
 
 		client, err := m.mgr.TransferClient(ctx, peer.Address)
 		if err != nil {
+			m.mgr.HandlePeerUnreachable(context.Background(), peer.NodeId, err)
 			log.Warn("transfer.claim.plan", logging.Outcome(logging.OutcomeFailed), logging.AttrVnodeId, vnode.Id, logging.AttrPeerId, peer.NodeId, logging.AttrPeerAddr, peer.Address, logging.Err(err))
 			return err
 		}
@@ -181,6 +182,7 @@ func (m *Manager) acquireAcceptedTransferPlan(ctx context.Context, vnode members
 			Requestor:  m.mgr.SelfId(),
 		})
 		if err != nil {
+			m.mgr.HandlePeerUnreachable(context.Background(), peer.NodeId, err)
 			log.Warn("transfer.claim.plan", logging.Outcome(logging.OutcomeFailed), logging.AttrVnodeId, vnode.Id, "transfer_id", plan.TransferId, logging.Err(err))
 			return err
 		}
@@ -254,11 +256,13 @@ func (m *Manager) streamSnapshot(ctx context.Context, plan rangeTransferPlan) er
 	log.Info("transfer.claim.snapshot", logging.Outcome(logging.OutcomeStarted), "transfer_id", plan.TransferId, logging.AttrPeerId, plan.OwnerNodeId, logging.AttrPeerAddr, plan.OwnerAddr, "target_vnode_id", plan.TargetVnodeId)
 	client, err := m.mgr.TransferClient(ctx, plan.OwnerAddr)
 	if err != nil {
+		m.mgr.HandlePeerUnreachable(context.Background(), plan.OwnerNodeId, err)
 		log.Error("transfer.claim.snapshot", logging.Outcome(logging.OutcomeFailed), "transfer_id", plan.TransferId, logging.AttrPeerAddr, plan.OwnerAddr, logging.Err(err))
 		return err
 	}
 	stream, err := client.StreamRange(ctx, &pb.StreamRangeRequest{TransferId: plan.StreamId})
 	if err != nil {
+		m.mgr.HandlePeerUnreachable(context.Background(), plan.OwnerNodeId, err)
 		log.Error("transfer.claim.snapshot", logging.Outcome(logging.OutcomeFailed), "transfer_id", plan.TransferId, logging.Err(err))
 		return fmt.Errorf("stream range %s: %w", plan.TransferId, err)
 	}
@@ -271,6 +275,7 @@ func (m *Manager) streamSnapshot(ctx context.Context, plan rangeTransferPlan) er
 			break
 		}
 		if err != nil {
+			m.mgr.HandlePeerUnreachable(context.Background(), plan.OwnerNodeId, err)
 			log.Error("transfer.claim.snapshot.recv", logging.Outcome(logging.OutcomeFailed), "transfer_id", plan.TransferId, logging.Err(err))
 			return fmt.Errorf("stream recv %s: %w", plan.TransferId, err)
 		}
@@ -305,6 +310,7 @@ func (m *Manager) completeTransferWithRetry(ctx context.Context, plan rangeTrans
 	log.Info("transfer.claim.complete", logging.Outcome(logging.OutcomeStarted), "transfer_id", plan.TransferId, logging.AttrPeerId, plan.OwnerNodeId, logging.AttrPeerAddr, plan.OwnerAddr)
 	client, err := m.mgr.TransferClient(ctx, plan.OwnerAddr)
 	if err != nil {
+		m.mgr.HandlePeerUnreachable(context.Background(), plan.OwnerNodeId, err)
 		log.Error("transfer.claim.complete", logging.Outcome(logging.OutcomeFailed), "transfer_id", plan.TransferId, logging.Err(err))
 		return err
 	}
@@ -312,6 +318,7 @@ func (m *Manager) completeTransferWithRetry(ctx context.Context, plan rangeTrans
 	if err := util.Do(ctx, util.TransferComplete, func() error {
 		resp, err := client.CompleteRangeTransfer(ctx, &pb.CompleteRangeTransferRequest{TransferId: plan.TransferId})
 		if err != nil {
+			m.mgr.HandlePeerUnreachable(context.Background(), plan.OwnerNodeId, err)
 			log.Warn("transfer.claim.complete", logging.Outcome(logging.OutcomeFailed), "transfer_id", plan.TransferId, logging.Err(err))
 			return err
 		}

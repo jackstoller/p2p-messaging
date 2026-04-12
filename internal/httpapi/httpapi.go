@@ -2,7 +2,6 @@ package httpapi
 
 import (
 	"context"
-	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"embed"
@@ -15,7 +14,6 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -29,19 +27,15 @@ import (
 )
 
 const (
-	authChallengeTTL     = 2 * time.Minute
-	sessionTTL           = 30 * 24 * time.Hour
 	presenceTTL          = 45 * time.Second
 	maxRequestBytes      = 1 << 20
-	maxMailboxSignals    = 128
+	maxPendingSignals    = 128
 	defaultPollTimeout   = 25 * time.Second
 	maxPollTimeout       = 30 * time.Second
 	nodeInfoRefreshTTL   = 60 * time.Second
 	authTokenPrefix      = "Bearer "
 	nodeHTTPRecordPrefix = "node-http-"
 	userRecordPrefix     = "user-"
-	sessionRecordPrefix  = "session-"
-	mailboxRecordPrefix  = "mailbox-"
 )
 
 var usernamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]{3,32}$`)
@@ -55,18 +49,14 @@ type API struct {
 	store            *storage.Store
 	nodeID           string
 	nodeHTTPBaseURL  string
+	iceServers       []iceServerEntry
 	pollersMu        sync.Mutex
 	pollers          map[string]map[chan struct{}]struct{}
-	challengesMu     sync.Mutex
-	authChallenges   map[string]authChallenge
+	signalsMu        sync.Mutex
+	pendingSignals   map[string][]signalEnvelope
 	httpClient       *http.Client
 	nodeInfoMu       sync.Mutex
 	lastNodeInfoPush time.Time
-}
-
-type authChallenge struct {
-	Nonce     string `json:"nonce"`
-	ExpiresAt int64  `json:"expiresAt"`
 }
 
 type writeRequest struct {
@@ -92,34 +82,24 @@ type errorResponse struct {
 }
 
 type registerRequest struct {
-	Username     string `json:"username"`
-	AuthSalt     string `json:"authSalt"`
-	AuthVerifier string `json:"authVerifier"`
-}
-
-type challengeResponse struct {
-	Username   string `json:"username"`
-	AuthSalt   string `json:"authSalt"`
-	Nonce      string `json:"nonce"`
-	ExpiresAt  int64  `json:"expiresAt"`
-	SessionTTL int64  `json:"sessionTtlMs"`
-}
-
-type loginRequest struct {
 	Username string `json:"username"`
-	Proof    string `json:"proof"`
 }
 
 type authResponse struct {
-	Username    string      `json:"username"`
-	Session     string      `json:"session"`
-	User        userView    `json:"user"`
-	NodeBaseURL string      `json:"nodeBaseUrl"`
-	Nodes       []nodeEntry `json:"nodes"`
+	Username    string           `json:"username"`
+	Secret      string           `json:"secret,omitempty"`
+	User        userView         `json:"user"`
+	NodeBaseURL string           `json:"nodeBaseUrl"`
+	Nodes       []nodeEntry      `json:"nodes"`
+	IceServers  []iceServerEntry `json:"iceServers"`
 }
 
 type presenceRequest struct {
 	NodeBaseURL string `json:"nodeBaseUrl"`
+}
+
+type iceServerEntry struct {
+	URLs []string `json:"urls"`
 }
 
 type startSessionRequest struct {
@@ -141,55 +121,39 @@ type pollResponse struct {
 }
 
 type sessionStateResponse struct {
-	User        userView    `json:"user"`
-	NodeBaseURL string      `json:"nodeBaseUrl"`
-	Nodes       []nodeEntry `json:"nodes"`
+	User        userView         `json:"user"`
+	NodeBaseURL string           `json:"nodeBaseUrl"`
+	Nodes       []nodeEntry      `json:"nodes"`
+	IceServers  []iceServerEntry `json:"iceServers"`
 }
 
 type connectResponse struct {
-	Target userView `json:"target"`
+	Target     userView         `json:"target"`
+	IceServers []iceServerEntry `json:"iceServers"`
 }
 
 type userRecord struct {
-	Username          string `json:"username"`
-	AuthSalt          string `json:"authSalt"`
-	AuthVerifier      string `json:"authVerifier"`
-	PrimaryNodeID     string `json:"primaryNodeId"`
-	CurrentNodeID     string `json:"currentNodeId"`
-	CurrentNodeHTTP   string `json:"currentNodeHttp"`
-	ActiveSessionID   string `json:"activeSessionId"`
-	PresenceExpiresAt int64  `json:"presenceExpiresAt"`
-	LastSeenAt        int64  `json:"lastSeenAt"`
-	CreatedAt         int64  `json:"createdAt"`
-	UpdatedAt         int64  `json:"updatedAt"`
-	DeletedAt         int64  `json:"deletedAt"`
-}
-
-type sessionRecord struct {
-	SessionID   string `json:"sessionId"`
-	Username    string `json:"username"`
-	SecretHash  string `json:"secretHash"`
-	CreatedAt   int64  `json:"createdAt"`
-	ExpiresAt   int64  `json:"expiresAt"`
-	LastSeenAt  int64  `json:"lastSeenAt"`
-	NodeID      string `json:"nodeId"`
-	NodeHTTP    string `json:"nodeHttp"`
-	RevokedAt   int64  `json:"revokedAt"`
-	VerifierRef string `json:"verifierRef,omitempty"`
+	Username          string   `json:"username"`
+	SecretHash        string   `json:"secretHash"`
+	PrimaryNodeID     string   `json:"primaryNodeId"`
+	CurrentNodeID     string   `json:"currentNodeId"`
+	CurrentNodeHTTP   string   `json:"currentNodeHttp"`
+	CurrentICEServers []string `json:"currentIceServers,omitempty"`
+	PresenceExpiresAt int64    `json:"presenceExpiresAt"`
+	LastSeenAt        int64    `json:"lastSeenAt"`
+	CreatedAt         int64    `json:"createdAt"`
+	UpdatedAt         int64    `json:"updatedAt"`
+	DeletedAt         int64    `json:"deletedAt"`
 }
 
 type signalEnvelope struct {
 	ID        string          `json:"id"`
 	Type      string          `json:"type"`
 	From      string          `json:"from"`
+	FromNode  string          `json:"fromNodeBaseUrl,omitempty"`
 	To        string          `json:"to"`
 	Payload   json.RawMessage `json:"payload"`
 	CreatedAt int64           `json:"createdAt"`
-}
-
-type mailboxRecord struct {
-	Username string           `json:"username"`
-	Signals  []signalEnvelope `json:"signals"`
 }
 
 type nodeHTTPRecord struct {
@@ -213,15 +177,16 @@ type nodeEntry struct {
 	IsActive bool   `json:"isActive"`
 }
 
-func New(node *meshserver.Server, mgr *membership.Manager, store *storage.Store, nodeID, httpAdvertise string) *API {
+func New(node *meshserver.Server, mgr *membership.Manager, store *storage.Store, nodeID, httpAdvertise string, iceServerURLs []string) *API {
 	return &API{
 		node:            node,
 		mgr:             mgr,
 		store:           store,
 		nodeID:          nodeID,
 		nodeHTTPBaseURL: normalizeHTTPBaseURL(httpAdvertise),
+		iceServers:      iceServerEntries(iceServerURLs),
 		pollers:         make(map[string]map[chan struct{}]struct{}),
-		authChallenges:  make(map[string]authChallenge),
+		pendingSignals:  make(map[string][]signalEnvelope),
 		httpClient: &http.Client{
 			Timeout: 4 * time.Second,
 		},
@@ -236,8 +201,6 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("/healthz", a.handleHealth)
 	mux.HandleFunc("/v1/records/", a.handleRecord)
 	mux.HandleFunc("/v1/auth/register", a.handleRegister)
-	mux.HandleFunc("/v1/auth/challenge", a.handleChallenge)
-	mux.HandleFunc("/v1/auth/login", a.handleLogin)
 	mux.HandleFunc("/v1/me", a.handleSessionState)
 	mux.HandleFunc("/v1/me/delete", a.handleDeleteAccount)
 	mux.HandleFunc("/v1/presence/heartbeat", a.handlePresenceHeartbeat)
@@ -247,7 +210,24 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("/v1/events/poll", a.handlePoll)
 	mux.HandleFunc("/v1/nodes", a.handleNodes)
 	mux.HandleFunc("/v1/internal/signals/deliver", a.handleInternalSignal)
-	return mux
+	return withCORS(mux)
+}
+
+func withCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+			w.Header().Set("Access-Control-Max-Age", "600")
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (a *API) PublishNodeInfo(ctx context.Context) error {
@@ -384,10 +364,6 @@ func (a *API) handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "username must be 3-32 characters of letters, numbers, hyphen, or underscore")
 		return
 	}
-	if req.AuthSalt == "" || req.AuthVerifier == "" {
-		writeError(w, http.StatusBadRequest, "authSalt and authVerifier are required")
-		return
-	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
@@ -402,177 +378,32 @@ func (a *API) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := storage.NowMillis()
+	secret := randomToken(32)
 	user := userRecord{
 		Username:          username,
-		AuthSalt:          req.AuthSalt,
-		AuthVerifier:      req.AuthVerifier,
+		SecretHash:        sha256Hex(secret),
 		PrimaryNodeID:     a.nodeID,
 		CurrentNodeID:     a.nodeID,
 		CurrentNodeHTTP:   a.requestBaseURL(r),
+		CurrentICEServers: iceServerURLs(a.iceServers),
 		PresenceExpiresAt: now + int64(presenceTTL/time.Millisecond),
 		LastSeenAt:        now,
 		CreatedAt:         now,
 		UpdatedAt:         now,
 	}
-	sessionToken, session, err := a.newSession(username, user.AuthVerifier, user.CurrentNodeHTTP)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to create session")
-		return
-	}
-	user.ActiveSessionID = session.SessionID
 
 	if err := a.writeJSONRecord(ctx, userKey, user); err != nil {
 		writeError(w, http.StatusServiceUnavailable, "failed to save user")
 		return
 	}
-	if err := a.writeJSONRecord(ctx, sessionRecordPrefix+session.SessionID, session); err != nil {
-		writeError(w, http.StatusServiceUnavailable, "failed to save session")
-		return
-	}
 
 	writeJSON(w, http.StatusOK, authResponse{
 		Username:    username,
-		Session:     sessionToken,
+		Secret:      secret,
 		User:        a.userView(user),
 		NodeBaseURL: user.CurrentNodeHTTP,
 		Nodes:       a.collectNodeEntries(ctx),
-	})
-}
-
-func (a *API) handleChallenge(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.Header().Set("Allow", "GET")
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	username := normalizeUsername(r.URL.Query().Get("username"))
-	if !usernamePattern.MatchString(username) {
-		writeError(w, http.StatusBadRequest, "invalid username")
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-
-	user, found, err := a.readUserRecord(ctx, userRecordPrefix+username)
-	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "failed to read user")
-		return
-	}
-	if !found {
-		writeError(w, http.StatusNotFound, "user not found")
-		return
-	}
-	if user.DeletedAt > 0 {
-		writeError(w, http.StatusNotFound, "user not found")
-		return
-	}
-
-	challenge := authChallenge{
-		Nonce:     randomToken(24),
-		ExpiresAt: time.Now().Add(authChallengeTTL).UnixMilli(),
-	}
-	a.challengesMu.Lock()
-	a.authChallenges[username] = challenge
-	a.challengesMu.Unlock()
-
-	writeJSON(w, http.StatusOK, challengeResponse{
-		Username:   username,
-		AuthSalt:   user.AuthSalt,
-		Nonce:      challenge.Nonce,
-		ExpiresAt:  challenge.ExpiresAt,
-		SessionTTL: int64(sessionTTL / time.Millisecond),
-	})
-}
-
-func (a *API) handleLogin(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", "POST")
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	if err := a.PublishNodeInfo(r.Context()); err != nil {
-		writeError(w, http.StatusServiceUnavailable, "node metadata unavailable")
-		return
-	}
-
-	var req loginRequest
-	if err := decodeJSONBody(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	username := normalizeUsername(req.Username)
-	if req.Proof == "" || !usernamePattern.MatchString(username) {
-		writeError(w, http.StatusBadRequest, "invalid login request")
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-
-	user, found, err := a.readUserRecord(ctx, userRecordPrefix+username)
-	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "failed to read user")
-		return
-	}
-	if !found {
-		writeError(w, http.StatusNotFound, "user not found")
-		return
-	}
-	if user.DeletedAt > 0 {
-		writeError(w, http.StatusNotFound, "user not found")
-		return
-	}
-
-	a.challengesMu.Lock()
-	challenge, ok := a.authChallenges[username]
-	if ok && challenge.ExpiresAt < storage.NowMillis() {
-		delete(a.authChallenges, username)
-		ok = false
-	}
-	if ok {
-		delete(a.authChallenges, username)
-	}
-	a.challengesMu.Unlock()
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "login challenge missing or expired")
-		return
-	}
-
-	expectedProof := computeChallengeProof(user.AuthVerifier, challenge.Nonce)
-	if !secureEqual(expectedProof, req.Proof) {
-		writeError(w, http.StatusUnauthorized, "invalid login proof")
-		return
-	}
-
-	user.CurrentNodeID = a.nodeID
-	user.CurrentNodeHTTP = a.requestBaseURL(r)
-	user.LastSeenAt = storage.NowMillis()
-	user.PresenceExpiresAt = user.LastSeenAt + int64(presenceTTL/time.Millisecond)
-	user.UpdatedAt = user.LastSeenAt
-
-	sessionToken, session, err := a.newSession(username, user.AuthVerifier, user.CurrentNodeHTTP)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to create session")
-		return
-	}
-	user.ActiveSessionID = session.SessionID
-
-	if err := a.writeJSONRecord(ctx, userRecordPrefix+username, user); err != nil {
-		writeError(w, http.StatusServiceUnavailable, "failed to save user")
-		return
-	}
-	if err := a.writeJSONRecord(ctx, sessionRecordPrefix+session.SessionID, session); err != nil {
-		writeError(w, http.StatusServiceUnavailable, "failed to save session")
-		return
-	}
-
-	writeJSON(w, http.StatusOK, authResponse{
-		Username:    username,
-		Session:     sessionToken,
-		User:        a.userView(user),
-		NodeBaseURL: user.CurrentNodeHTTP,
-		Nodes:       a.collectNodeEntries(ctx),
+		IceServers:  a.iceServers,
 	})
 }
 
@@ -582,18 +413,19 @@ func (a *API) handleSessionState(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	user, session, ok := a.authenticate(r)
+	user, ok := a.authenticate(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "invalid session")
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	a.touchSession(ctx, &user, &session, a.requestBaseURL(r))
+	a.touchUser(ctx, &user, a.requestBaseURL(r))
 	writeJSON(w, http.StatusOK, sessionStateResponse{
 		User:        a.userView(user),
 		NodeBaseURL: a.requestBaseURL(r),
 		Nodes:       a.collectNodeEntries(ctx),
+		IceServers:  a.iceServers,
 	})
 }
 
@@ -603,7 +435,7 @@ func (a *API) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	user, session, ok := a.authenticate(r)
+	user, ok := a.authenticate(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "invalid session")
 		return
@@ -612,19 +444,12 @@ func (a *API) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 	now := storage.NowMillis()
 	user.DeletedAt = now
 	user.PresenceExpiresAt = now
-	user.ActiveSessionID = ""
 	user.UpdatedAt = now
-	session.RevokedAt = now
-	session.LastSeenAt = now
 
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	if err := a.writeJSONRecord(ctx, userRecordPrefix+user.Username, user); err != nil {
 		writeError(w, http.StatusServiceUnavailable, "failed to delete account")
-		return
-	}
-	if err := a.writeJSONRecord(ctx, sessionRecordPrefix+session.SessionID, session); err != nil {
-		writeError(w, http.StatusServiceUnavailable, "failed to revoke session")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
@@ -636,7 +461,7 @@ func (a *API) handlePresenceHeartbeat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	user, session, ok := a.authenticate(r)
+	user, ok := a.authenticate(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "invalid session")
 		return
@@ -650,11 +475,12 @@ func (a *API) handlePresenceHeartbeat(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	a.touchSession(ctx, &user, &session, baseURL)
+	a.touchUser(ctx, &user, baseURL)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":          true,
 		"user":        a.userView(user),
 		"nodeBaseUrl": baseURL,
+		"iceServers":  a.iceServers,
 	})
 }
 
@@ -664,7 +490,7 @@ func (a *API) handlePresenceOffline(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	user, session, ok := a.authenticate(r)
+	user, ok := a.authenticate(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "invalid session")
 		return
@@ -673,11 +499,9 @@ func (a *API) handlePresenceOffline(w http.ResponseWriter, r *http.Request) {
 	now := storage.NowMillis()
 	user.PresenceExpiresAt = now
 	user.UpdatedAt = now
-	session.LastSeenAt = now
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	_ = a.writeJSONRecord(ctx, userRecordPrefix+user.Username, user)
-	_ = a.writeJSONRecord(ctx, sessionRecordPrefix+session.SessionID, session)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -687,7 +511,7 @@ func (a *API) handlePeerConnect(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	_, _, ok := a.authenticate(r)
+	_, ok := a.authenticate(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "invalid session")
 		return
@@ -718,7 +542,10 @@ func (a *API) handlePeerConnect(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "target user not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, connectResponse{Target: a.userView(target)})
+	writeJSON(w, http.StatusOK, connectResponse{
+		Target:     a.userView(target),
+		IceServers: iceServerEntries(target.CurrentICEServers),
+	})
 }
 
 func (a *API) handleSignal(w http.ResponseWriter, r *http.Request) {
@@ -727,7 +554,7 @@ func (a *API) handleSignal(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	user, _, ok := a.authenticate(r)
+	user, ok := a.authenticate(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "invalid session")
 		return
@@ -752,6 +579,7 @@ func (a *API) handleSignal(w http.ResponseWriter, r *http.Request) {
 		ID:        randomToken(18),
 		Type:      req.Type,
 		From:      user.Username,
+		FromNode:  a.requestBaseURL(r),
 		To:        targetUsername,
 		Payload:   req.Payload,
 		CreatedAt: storage.NowMillis(),
@@ -778,10 +606,7 @@ func (a *API) handleInternalSignal(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid signal")
 		return
 	}
-	if err := a.appendMailboxSignal(r.Context(), req.Signal.To, req.Signal); err != nil {
-		writeError(w, http.StatusServiceUnavailable, "failed to queue signal")
-		return
-	}
+	a.appendPendingSignal(req.Signal.To, req.Signal)
 	a.notifyUser(req.Signal.To)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
@@ -792,7 +617,7 @@ func (a *API) handlePoll(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	user, _, ok := a.authenticate(r)
+	user, ok := a.authenticate(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "invalid session")
 		return
@@ -805,7 +630,7 @@ func (a *API) handlePoll(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if signals, err := a.consumeMailboxSignals(r.Context(), user.Username); err == nil && len(signals) > 0 {
+	if signals := a.consumePendingSignals(user.Username); len(signals) > 0 {
 		writeJSON(w, http.StatusOK, pollResponse{Signals: signals})
 		return
 	}
@@ -823,12 +648,7 @@ func (a *API) handlePoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	signals, err := a.consumeMailboxSignals(r.Context(), user.Username)
-	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "failed to load signals")
-		return
-	}
-	writeJSON(w, http.StatusOK, pollResponse{Signals: signals})
+	writeJSON(w, http.StatusOK, pollResponse{Signals: a.consumePendingSignals(user.Username)})
 }
 
 func (a *API) handleNodes(w http.ResponseWriter, r *http.Request) {
@@ -837,7 +657,7 @@ func (a *API) handleNodes(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	if _, _, ok := a.authenticate(r); !ok {
+	if _, ok := a.authenticate(r); !ok {
 		writeError(w, http.StatusUnauthorized, "invalid session")
 		return
 	}
@@ -859,22 +679,19 @@ func (a *API) routeSignal(ctx context.Context, envelope signalEnvelope) error {
 		return fmt.Errorf("target user not found")
 	}
 
-	if target.CurrentNodeID == a.nodeID || target.CurrentNodeHTTP == "" {
-		if err := a.appendMailboxSignal(ctx, envelope.To, envelope); err != nil {
-			return fmt.Errorf("failed to queue signal")
-		}
+	if target.CurrentNodeID == a.nodeID {
+		a.appendPendingSignal(envelope.To, envelope)
 		a.notifyUser(envelope.To)
 		return nil
+	}
+	if target.CurrentNodeHTTP == "" {
+		return fmt.Errorf("target node unavailable")
 	}
 
 	if err := a.forwardSignal(ctx, target.CurrentNodeHTTP, envelope); err == nil {
 		return nil
 	}
-
-	if err := a.appendMailboxSignal(ctx, envelope.To, envelope); err != nil {
-		return fmt.Errorf("failed to queue signal")
-	}
-	return nil
+	return fmt.Errorf("failed to deliver signal")
 }
 
 func (a *API) forwardSignal(ctx context.Context, baseURL string, envelope signalEnvelope) error {
@@ -896,83 +713,58 @@ func (a *API) forwardSignal(ctx context.Context, baseURL string, envelope signal
 	return nil
 }
 
-func (a *API) newSession(username, verifier, nodeHTTP string) (string, sessionRecord, error) {
-	sessionID := randomToken(12)
-	secret := randomToken(32)
-	token := sessionID + "." + secret
-	now := storage.NowMillis()
-	record := sessionRecord{
-		SessionID:   sessionID,
-		Username:    username,
-		SecretHash:  sha256Hex(secret),
-		CreatedAt:   now,
-		ExpiresAt:   now + int64(sessionTTL/time.Millisecond),
-		LastSeenAt:  now,
-		NodeID:      a.nodeID,
-		NodeHTTP:    nodeHTTP,
-		VerifierRef: sha256Hex(verifier),
-	}
-	return token, record, nil
-}
-
-func (a *API) authenticate(r *http.Request) (userRecord, sessionRecord, bool) {
+func (a *API) authenticate(r *http.Request) (userRecord, bool) {
 	token := a.extractSessionToken(r)
 	if token == "" {
-		return userRecord{}, sessionRecord{}, false
+		return userRecord{}, false
 	}
 	parts := strings.Split(token, ".")
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return userRecord{}, sessionRecord{}, false
+		return userRecord{}, false
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	var session sessionRecord
-	found, err := a.readJSONRecord(ctx, sessionRecordPrefix+parts[0], &session)
-	if err != nil || !found {
-		return userRecord{}, sessionRecord{}, false
-	}
-	if session.RevokedAt > 0 || session.ExpiresAt < storage.NowMillis() || !secureEqual(session.SecretHash, sha256Hex(parts[1])) {
-		return userRecord{}, sessionRecord{}, false
+	username := normalizeUsername(parts[0])
+	if !usernamePattern.MatchString(username) {
+		return userRecord{}, false
 	}
 
 	var user userRecord
-	found, err = a.readJSONRecord(ctx, userRecordPrefix+session.Username, &user)
+	found, err := a.readJSONRecord(ctx, userRecordPrefix+username, &user)
 	if err != nil || !found {
-		return userRecord{}, sessionRecord{}, false
+		return userRecord{}, false
 	}
 	if user.DeletedAt > 0 {
-		return userRecord{}, sessionRecord{}, false
+		return userRecord{}, false
 	}
-	return user, session, true
+	if !secureEqual(user.SecretHash, strings.ToLower(strings.TrimSpace(parts[1]))) {
+		return userRecord{}, false
+	}
+	return user, true
 }
 
 func (a *API) extractSessionToken(r *http.Request) string {
 	if token := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), authTokenPrefix)); token != "" {
 		return token
 	}
-	if token := strings.TrimSpace(r.URL.Query().Get("session")); token != "" {
+	if token := strings.TrimSpace(r.URL.Query().Get("auth")); token != "" {
 		return token
 	}
 	return ""
 }
 
-func (a *API) touchSession(ctx context.Context, user *userRecord, session *sessionRecord, baseURL string) {
+func (a *API) touchUser(ctx context.Context, user *userRecord, baseURL string) {
 	now := storage.NowMillis()
 	user.CurrentNodeID = a.nodeID
 	user.CurrentNodeHTTP = normalizeHTTPBaseURL(baseURL)
+	user.CurrentICEServers = iceServerURLs(a.iceServers)
 	user.LastSeenAt = now
 	user.PresenceExpiresAt = now + int64(presenceTTL/time.Millisecond)
 	user.UpdatedAt = now
-	user.ActiveSessionID = session.SessionID
-
-	session.NodeID = a.nodeID
-	session.NodeHTTP = user.CurrentNodeHTTP
-	session.LastSeenAt = now
 
 	_ = a.writeJSONRecord(ctx, userRecordPrefix+user.Username, *user)
-	_ = a.writeJSONRecord(ctx, sessionRecordPrefix+session.SessionID, *session)
 }
 
 func (a *API) userView(user userRecord) userView {
@@ -1035,33 +827,31 @@ func (a *API) notifyUser(username string) {
 	}
 }
 
-func (a *API) appendMailboxSignal(ctx context.Context, username string, signal signalEnvelope) error {
-	key := mailboxRecordPrefix + username
-	mailbox := mailboxRecord{Username: username}
-	_, _ = a.readJSONRecord(ctx, key, &mailbox)
-	if slices.ContainsFunc(mailbox.Signals, func(existing signalEnvelope) bool { return existing.ID == signal.ID }) {
-		return nil
+func (a *API) appendPendingSignal(username string, signal signalEnvelope) {
+	a.signalsMu.Lock()
+	defer a.signalsMu.Unlock()
+	queue := a.pendingSignals[username]
+	for _, existing := range queue {
+		if existing.ID == signal.ID {
+			return
+		}
 	}
-	mailbox.Signals = append(mailbox.Signals, signal)
-	if len(mailbox.Signals) > maxMailboxSignals {
-		mailbox.Signals = mailbox.Signals[len(mailbox.Signals)-maxMailboxSignals:]
+	queue = append(queue, signal)
+	if len(queue) > maxPendingSignals {
+		queue = queue[len(queue)-maxPendingSignals:]
 	}
-	return a.writeJSONRecord(ctx, key, mailbox)
+	a.pendingSignals[username] = queue
 }
 
-func (a *API) consumeMailboxSignals(ctx context.Context, username string) ([]signalEnvelope, error) {
-	key := mailboxRecordPrefix + username
-	var mailbox mailboxRecord
-	found, err := a.readJSONRecord(ctx, key, &mailbox)
-	if err != nil || !found || len(mailbox.Signals) == 0 {
-		return nil, err
+func (a *API) consumePendingSignals(username string) []signalEnvelope {
+	a.signalsMu.Lock()
+	defer a.signalsMu.Unlock()
+	signals := a.pendingSignals[username]
+	if len(signals) == 0 {
+		return nil
 	}
-	signals := mailbox.Signals
-	mailbox.Signals = nil
-	if err := a.writeJSONRecord(ctx, key, mailbox); err != nil {
-		return nil, err
-	}
-	return signals, nil
+	delete(a.pendingSignals, username)
+	return append([]signalEnvelope(nil), signals...)
 }
 
 func (a *API) readUserRecord(ctx context.Context, key string) (userRecord, bool, error) {
@@ -1220,6 +1010,21 @@ func normalizeHTTPBaseURL(raw string) string {
 	return strings.TrimRight(parsed.String(), "/")
 }
 
+func iceServerEntries(urls []string) []iceServerEntry {
+	if len(urls) == 0 {
+		return nil
+	}
+	return []iceServerEntry{{URLs: urls}}
+}
+
+func iceServerURLs(entries []iceServerEntry) []string {
+	var urls []string
+	for _, entry := range entries {
+		urls = append(urls, entry.URLs...)
+	}
+	return urls
+}
+
 func randomToken(byteLen int) string {
 	buf := make([]byte, byteLen)
 	if _, err := rand.Read(buf); err != nil {
@@ -1233,12 +1038,13 @@ func sha256Hex(value string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func computeChallengeProof(verifier, nonce string) string {
-	mac := hmac.New(sha256.New, []byte(verifier))
-	mac.Write([]byte(nonce))
-	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
-}
-
 func secureEqual(a, b string) bool {
-	return hmac.Equal([]byte(a), []byte(b))
+	if len(a) != len(b) {
+		return false
+	}
+	diff := byte(0)
+	for i := 0; i < len(a); i++ {
+		diff |= a[i] ^ b[i]
+	}
+	return diff == 0
 }

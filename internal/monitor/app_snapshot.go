@@ -84,7 +84,7 @@ func (a *App) snapshotNodes(nodeIds []string, transfers []transferState) ([]Node
 }
 
 func buildNodeSnapshot(node *nodeState, transfers []transferState, now time.Time, colorIndex int) (NodeView, RingNodeView) {
-	vnodeViews := snapshotVnodes(node.Vnodes)
+	vnodeViews := snapshotVnodes(node.Vnodes, node.Status)
 	recordViews := snapshotRecords(node.Records)
 	nodeTransfers := snapshotNodeTransfers(transfers, node.NodeId)
 	tags, action := deriveNodeTags(node, now, nodeTransfers)
@@ -132,7 +132,7 @@ func countActiveTransfers(transfers []transferState) int {
 	return count
 }
 
-func snapshotVnodes(vnodes map[string]*vnodeState) []vnodeState {
+func snapshotVnodes(vnodes map[string]*vnodeState, nodeStatus string) []vnodeState {
 	list := make([]vnodeState, 0, len(vnodes))
 	for _, vnode := range vnodes {
 		list = append(list, *vnode)
@@ -140,6 +140,14 @@ func snapshotVnodes(vnodes map[string]*vnodeState) []vnodeState {
 	sort.Slice(list, func(i, j int) bool {
 		return list[i].Angle < list[j].Angle
 	})
+	if nodeStatus == statusOffline {
+		for i := range list {
+			list[i].Active = false
+			list[i].RangeStart = ""
+			list[i].RangeEnd = ""
+		}
+		return list
+	}
 	active := make([]vnodeState, 0, len(list))
 	for _, vnode := range list {
 		if vnode.Active {

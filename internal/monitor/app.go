@@ -564,15 +564,6 @@ func marksNodeOffline(event, outcome string, fields map[string]string) bool {
 	if strings.Contains(event, "node.shutdown") {
 		return true
 	}
-	if strings.EqualFold(fields["state"], "PEER_DOWN") {
-		return true
-	}
-	if event == "heartbeat.declare_down" && outcome == "succeeded" {
-		return true
-	}
-	if event == "membership.peer.down" && outcome == "succeeded" {
-		return true
-	}
 	return false
 }
 

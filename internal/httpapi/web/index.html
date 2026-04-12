@@ -9,13 +9,14 @@
 <body>
     <section id="authScreen" class="auth-screen">
         <div class="auth-card">
-            <p class="eyebrow">Mesh-backed chat</p>
+            <p class="eyebrow">Secure chat</p>
             <h1>Meshline</h1>
-            <p class="lede">Create a username and jump straight into your conversations. Your recovery secret is generated and cached locally in the browser.</p>
-            <label for="createUsername">Username</label>
-            <input id="createUsername" placeholder="username" autocomplete="username">
-            <button id="createAccountBtn">Create account</button>
-            <p class="hint">If this browser already has cached credentials, you will go directly into the app next time.</p>
+            <p class="lede">Pick a username and start chatting. Your session will be cached in the browser</p>
+            <div class="stack-form">
+                <label for="createUsername">Username</label>
+                <input id="createUsername" placeholder="username" autocomplete="username">
+                <button id="createAccountBtn">Create account</button>
+            </div>
         </div>
     </section>
 
@@ -33,39 +34,7 @@
                 <span id="sidebarPresence">Offline</span>
             </div>
             <div id="conversationList" class="conversation-list"></div>
-        </aside>
-
-        <section class="chat-pane card">
-            <div class="chat-head">
-                <div>
-                    <button id="backToListBtn" class="ghost small mobile-only">Back</button>
-                    <div class="chat-identity">
-                        <span id="peerStatusDot" class="status-dot"></span>
-                        <h2 id="chatTitle">New conversation</h2>
-                    </div>
-                    <p id="chatSubtitle" class="hint">Pick a conversation or start a new one.</p>
-                </div>
-                <button id="showFingerprintBtn" class="ghost small">Fingerprint</button>
-            </div>
-
-            <div id="newConversationPanel" class="inline-panel">
-                <label for="newConversationInput">Start a new chat</label>
-                <div class="inline-row">
-                    <input id="newConversationInput" placeholder="username">
-                    <button id="connectPeerBtn">Start chat</button>
-                </div>
-            </div>
-
-            <div id="messages" class="messages"></div>
-
-            <div class="composer">
-                <textarea id="messageInput" rows="3" placeholder="Write a message"></textarea>
-                <div class="composer-row">
-                    <button id="sendBtn">Send</button>
-                </div>
-            </div>
-
-            <div class="profile-panel">
+            <div class="profile-panel sidebar-profile">
                 <div class="profile-copy">
                     <p class="eyebrow">Profile</p>
                     <h3 id="profileUsername">username</h3>
@@ -76,12 +45,47 @@
                     <button id="deleteAccountBtn" class="danger small">Delete account</button>
                 </div>
             </div>
+        </aside>
+
+        <section class="chat-pane card">
+            <div class="chat-head">
+                <div>
+                    <div class="chat-identity">
+                        <span id="peerStatusDot" class="status-dot"></span>
+                        <h2 id="chatTitle">New conversation</h2>
+                    </div>
+                    <p id="chatSubtitle" class="hint">Pick a conversation or start a new one.</p>
+                </div>
+                <div class="chat-head-actions">
+                    <button id="backToListBtn" class="ghost small">Back</button>
+                    <button id="disconnectPeerBtn" class="ghost small" disabled>Disconnect</button>
+                    <button id="showFingerprintBtn" class="ghost small" disabled>Fingerprint</button>
+                </div>
+            </div>
+
+            <div id="newConversationPanel" class="inline-panel">
+                <label for="newConversationInput">Start a new chat</label>
+                <div class="inline-row">
+                    <input id="newConversationInput" placeholder="username">
+                    <button id="connectPeerBtn">Start chat</button>
+                </div>
+                <p id="newConversationStatus" class="inline-status hidden" aria-live="polite">Connecting...</p>
+            </div>
+
+            <div id="messages" class="messages"></div>
+
+            <div class="composer">
+                <textarea id="messageInput" rows="3" placeholder="Write a message"></textarea>
+                <div class="composer-row">
+                    <button id="sendBtn">Send</button>
+                </div>
+            </div>
         </section>
     </main>
 
     <dialog id="fingerprintDialog" class="fingerprint-dialog">
         <form method="dialog" class="fingerprint-card">
-            <p class="eyebrow">End-to-end fingerprint</p>
+            <p class="eyebrow">Fingerprint</p>
             <h3 id="fingerprintValue">Unavailable</h3>
             <p class="hint">Verify this value with the other person over a second channel.</p>
             <button class="ghost">Close</button>

@@ -65,6 +65,18 @@ func (s *Server) executeLocalWrite(ctx context.Context, req *pb.WriteRequest, pl
 	}, nil
 }
 
+func (s *Server) failoverWritePlan(ctx context.Context, key, failedPrimaryId string, callErr error) (writePlan, bool) {
+	if !s.mgr.HandlePeerUnreachable(ctx, failedPrimaryId, callErr) {
+		return writePlan{}, false
+	}
+
+	plan, err := s.resolveWritePlan(key)
+	if err != nil || plan.primaryNodeId == failedPrimaryId {
+		return writePlan{}, false
+	}
+	return plan, true
+}
+
 func (s *Server) replicateLocalWrite(result localWriteResult) {
 	go s.repl.ReplicateRecord(context.Background(), result.vnodeId, result.record)
 }

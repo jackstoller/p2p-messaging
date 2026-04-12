@@ -651,9 +651,11 @@ setInterval(() => {
 }, NODE_REFRESH_MS * 2);
 
 function buildSingleNodeContext(node) {
-    const uniqueVnodes = dedupeVnodes(ownVnodesForNode(node)).sort(compareByPositionThenId);
-    const ranges = buildGlobalRangeContext([{ ...node, vnodes: uniqueVnodes }]);
     const nodeId = String(node?.nodeId || 'unknown');
+    const uniqueVnodes = dedupeVnodes(ownVnodesForNode(node))
+        .map((vnode) => ({ ...vnode, nodeId: ownerNodeIdForVnode(vnode, nodeId) }))
+        .sort(compareByPositionThenId);
+    const ranges = buildGlobalRangeContext([{ ...node, vnodes: uniqueVnodes }]);
     const inventory = { records: Array.isArray(node?.records) ? node.records : [] };
     const activeCount = uniqueVnodes.filter((vnode) => vnode?.active).length;
     const inactiveCount = Math.max(0, uniqueVnodes.length - activeCount);
@@ -664,7 +666,7 @@ function buildSingleNodeContext(node) {
         nodeAddr: String(node?.nodeAddr || '-'),
         badge,
         summary: `Nodes (total/online/suspect/offline): <strong>${counts.total}/${counts.online}/${counts.suspect}/${counts.offline}</strong> | Virtual Nodes (total/active/inactive): <strong>${uniqueVnodes.length}/${activeCount}/${inactiveCount}</strong>`,
-        pieHtml: renderRangePieChart(uniqueVnodes, `node-${safeDomId(nodeId)}-pie`, false),
+        pieHtml: renderRangePieChart(uniqueVnodes, `node-${safeDomId(nodeId)}-pie`),
         localRowsHtml: renderLocalRecordRows(inventory.records || []),
         vnodeRowsHtml: renderVNodeRows(uniqueVnodes, ranges, nodeId)
     };
@@ -679,7 +681,7 @@ function buildAllVnodesContext(nodes) {
             if (!key || vnodeMap.has(key)) {
                 continue;
             }
-            vnodeMap.set(key, { ...vnode, nodeId: node?.nodeId || 'unknown' });
+            vnodeMap.set(key, { ...vnode, nodeId: ownerNodeIdForVnode(vnode, String(node?.nodeId || 'unknown')) });
         }
     }
     const allVnodes = Array.from(vnodeMap.values()).sort(compareByPositionThenId);
@@ -688,7 +690,7 @@ function buildAllVnodesContext(nodes) {
     const counts = nodeStatusCounts(state.nodes);
     return {
         summary: `Nodes (total/online/suspect/offline): <strong>${counts.total}/${counts.online}/${counts.suspect}/${counts.offline}</strong> | Virtual Nodes (total/active/inactive): <strong>${allVnodes.length}/${activeCount}/${Math.max(0, allVnodes.length - activeCount)}</strong>`,
-        pieHtml: renderRangePieChart(allVnodes, 'all-vnodes-pie', true),
+        pieHtml: renderRangePieChart(allVnodes, 'all-vnodes-pie'),
         vnodeRowsHtml: renderVNodeRows(allVnodes, ranges, '', true),
         localRowsHtml: '',
         readResultHtml: '',
@@ -724,14 +726,15 @@ function renderVNodeRows(vnodes, ranges, nodeId, includeNodeColumn) {
     }
     return vnodes.map((vnode) => {
         const vnodeId = escapeHtml(vnode?.vnodeId || '-');
-        const key = `${vnode?.nodeId || nodeId || ''}|${vnode?.vnodeId || ''}`;
+        const ownerNodeId = ownerNodeIdForVnode(vnode, nodeId || 'unknown');
+        const key = `${ownerNodeId}|${vnode?.vnodeId || ''}`;
         const range = ranges.get(key);
         const start = escapeHtml(range?.start || vnode?.rangeStart || '-');
         const end = escapeHtml(range?.end || vnode?.rangeEnd || '-');
         const statusText = vnode?.active ? 'ACTIVE' : 'INACTIVE';
         const statusClass = vnode?.active ? 'net-active' : 'net-inactive';
         const cols = includeNodeColumn
-            ? `<td><code>${escapeHtml(vnode?.nodeId || '-')}</code></td>`
+            ? `<td><code>${escapeHtml(ownerNodeId)}</code></td>`
             : '';
         return `<tr><td><code>${vnodeId}</code></td>${cols}<td><code>${escapeHtml(vnode?.position || '-')}</code></td><td><code>${start}</code></td><td><code>${end}</code></td><td><span class="node-network ${statusClass}">${statusText}</span></td></tr>`;
     }).join('');
@@ -759,6 +762,20 @@ function ownVnodesForNode(node) {
     return nodeId ? all.filter((vnode) => String(vnode?.vnodeId || '').startsWith(nodeId + ':')) : all;
 }
 
+function ownerNodeIdForVnode(vnode, fallbackNodeId) {
+    const explicit = String(vnode?.nodeId || '').trim();
+    if (explicit) {
+        return explicit;
+    }
+    const vnodeId = String(vnode?.vnodeId || '');
+    const separator = vnodeId.indexOf(':');
+    if (separator > 0) {
+        return vnodeId.slice(0, separator);
+    }
+    const fallback = String(fallbackNodeId || '').trim();
+    return fallback || 'unknown';
+}
+
 function compareByPositionThenId(a, b) {
     const apos = toBigIntPosition(a?.position);
     const bpos = toBigIntPosition(b?.position);
@@ -774,15 +791,15 @@ function compareByPositionThenId(a, b) {
     return String(a?.vnodeId || '').localeCompare(String(b?.vnodeId || ''));
 }
 
-function renderRangePieChart(vnodes, chartId, showNodeLegend) {
+function renderRangePieChart(vnodes, chartId) {
     const segments = buildRangeSegments(vnodes);
     if (!segments.length) {
         return '<div class="range-pie-card"><p class="range-pie-empty">Range pie unavailable until vnode positions are observed.</p></div>';
     }
-    const cx = 80;
-    const cy = 80;
-    const outer = 86;
-    const inner = 36;
+    const cx = 90;
+    const cy = 90;
+    const outer = 84;
+    const inner = 38;
     let start = 0;
     const arcs = [];
     for (const segment of segments) {
@@ -793,13 +810,12 @@ function renderRangePieChart(vnodes, chartId, showNodeLegend) {
             : `<path d="${describeDonutSlice(cx, cy, outer, inner, start, end)}" fill="${segment.color}" class="range-pie-segment"/>`);
         start = end;
     }
-    const legend = segments.map((segment) => {
-        const label = showNodeLegend
-            ? `${escapeHtml(segment.vnodeId)} @ ${escapeHtml(segment.nodeId)}`
-            : escapeHtml(segment.vnodeId);
-        return `<li class="range-legend-row"><span class="range-chip" style="background:${segment.color}"></span><span class="range-legend-label">${label}</span><span class="range-legend-size">${(Number(segment.ratio) * 100).toFixed(2)}%</span></li>`;
+    const legendEntries = buildRangeLegendEntries(segments);
+    const legend = legendEntries.map((entry) => {
+        const label = escapeHtml(entry.nodeId);
+        return `<li class="range-legend-row"><span class="range-chip" style="background:${entry.color}"></span><span class="range-legend-label">${label}</span><span class="range-legend-size">${(Number(entry.ratio) * 100).toFixed(2)}%</span></li>`;
     }).join('');
-    return `<div class="range-pie-card"><div class="range-pie-head"><h3>Ring Distribution</h3><p>Ordered around the ring by vnode position.</p></div><div class="range-pie-layout"><svg id="${chartId}" class="range-pie" viewBox="0 0 160 160" role="img" aria-label="Vnode range pie chart">${arcs.join('')}<circle cx="${cx}" cy="${cy}" r="${inner}" class="range-pie-core"></circle></svg><ul class="range-legend">${legend}</ul></div></div>`;
+    return `<div class="range-pie-card"><div class="range-pie-head"><h3>Ring Distribution</h3><p>Ordered around the ring by vnode position.</p></div><div class="range-pie-layout"><svg id="${chartId}" class="range-pie" viewBox="0 0 180 180" role="img" aria-label="Node range pie chart">${arcs.join('')}<circle cx="${cx}" cy="${cy}" r="${inner}" class="range-pie-core"></circle></svg><ul class="range-legend">${legend}</ul></div></div>`;
 }
 
 function buildRangeSegments(vnodes) {
@@ -807,22 +823,65 @@ function buildRangeSegments(vnodes) {
     if (!items.length) {
         return [];
     }
+    const colorByNode = createNodeColorMap(items.map((item) => ownerNodeIdForVnode(item.vnode, 'unknown')));
     if (items.length === 1) {
         const only = items[0].vnode;
-        return [{ vnodeId: String(only?.vnodeId || 'unknown'), nodeId: String(only?.nodeId || 'unknown'), color: colorForVNode(only), ratio: 1 }];
+        const ownerNodeId = ownerNodeIdForVnode(only, 'unknown');
+        return [{ vnodeId: String(only?.vnodeId || 'unknown'), nodeId: ownerNodeId, color: colorByNode.get(ownerNodeId) || colorForNode(ownerNodeId), ratio: 1 }];
     }
     items.sort((a, b) => (a.position < b.position ? -1 : (a.position > b.position ? 1 : 0)));
     return items.map((current, i) => {
         const previous = items[(i - 1 + items.length) % items.length];
         const span = modPositive(current.position - previous.position, RING_MODULUS);
         const ratio = Number(span) / Number(RING_MODULUS);
+        const ownerNodeId = ownerNodeIdForVnode(current.vnode, 'unknown');
         return {
             vnodeId: String(current.vnode?.vnodeId || 'unknown'),
-            nodeId: String(current.vnode?.nodeId || 'unknown'),
-            color: colorForVNode(current.vnode),
+            nodeId: ownerNodeId,
+            color: colorByNode.get(ownerNodeId) || colorForNode(ownerNodeId),
             ratio: Number.isFinite(ratio) ? ratio : 0
         };
     }).filter((segment) => segment.ratio > 0);
+}
+
+function createNodeColorMap(nodeIds) {
+    const normalized = Array.from(new Set((nodeIds || []).map((id) => String(id || '').trim() || 'unknown'))).sort((a, b) => a.localeCompare(b));
+    const palette = [
+        '#1f77b4', '#d62728', '#2ca02c', '#ff7f0e', '#17becf', '#8c564b',
+        '#e377c2', '#bcbd22', '#9467bd', '#7f7f7f', '#aec7e8', '#98df8a'
+    ];
+    const colorByNode = new Map();
+    normalized.forEach((nodeId, index) => {
+        if (nodeId === 'unknown') {
+            colorByNode.set(nodeId, '#7b8794');
+            return;
+        }
+        if (index < palette.length) {
+            colorByNode.set(nodeId, palette[index]);
+            return;
+        }
+        const hue = (index * 137.508) % 360;
+        colorByNode.set(nodeId, `hsl(${hue.toFixed(1)} 62% 47%)`);
+    });
+    return colorByNode;
+}
+
+function buildRangeLegendEntries(segments) {
+    const byNode = new Map();
+    for (const segment of segments) {
+        const key = String(segment?.nodeId || 'unknown');
+        const existing = byNode.get(key);
+        if (existing) {
+            existing.ratio += Number(segment?.ratio || 0);
+            continue;
+        }
+        byNode.set(key, {
+            nodeId: key,
+            color: segment?.color || colorForNode(key),
+            ratio: Number(segment?.ratio || 0)
+        });
+    }
+    return Array.from(byNode.values()).sort((a, b) => Number(b.ratio) - Number(a.ratio));
 }
 
 function buildGlobalRangeContext(allNodes) {
@@ -951,8 +1010,8 @@ function modPositive(value, modulus) {
     return result >= 0 ? result : result + modulus;
 }
 
-function colorForVNode(vnode) {
-    const input = `${vnode?.nodeId || ''}|${vnode?.vnodeId || ''}`;
+function colorForNode(nodeId) {
+    const input = String(nodeId || '');
     let hash = 0;
     for (let i = 0; i < input.length; i += 1) {
         hash = ((hash * 31) + input.charCodeAt(i)) >>> 0;

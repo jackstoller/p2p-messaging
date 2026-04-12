@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -22,6 +24,7 @@ import (
 	"github.com/jackstoller/p2p-messaging/internal/replica"
 	"github.com/jackstoller/p2p-messaging/internal/server"
 	"github.com/jackstoller/p2p-messaging/internal/storage"
+	"github.com/jackstoller/p2p-messaging/internal/stun"
 	"github.com/jackstoller/p2p-messaging/internal/transfer"
 	pb "github.com/jackstoller/p2p-messaging/proto"
 	"google.golang.org/grpc"
@@ -48,7 +51,7 @@ func initLogger(cfg config.NodeConfig) {
 
 func run(cfg config.NodeConfig) error {
 	log := logging.Component("main")
-	log.Info("node.start", logging.Outcome(logging.OutcomeStarted), "listen_addr", cfg.ListenAddr, "http_listen_addr", cfg.HTTPListenAddr, "bootstrap_peers", len(cfg.BootstrapPeers), "replica_count", cfg.ReplicaCount, "db_path", cfg.DBPath, "log_level", cfg.LogLevel)
+	log.Info("node.start", logging.Outcome(logging.OutcomeStarted), "listen_addr", cfg.ListenAddr, "http_listen_addr", cfg.HTTPListenAddr, "stun_listen_addr", cfg.STUNListenAddr, "bootstrap_peers", len(cfg.BootstrapPeers), "replica_count", cfg.ReplicaCount, "db_path", cfg.DBPath, "log_level", cfg.LogLevel)
 
 	tlsCfg, err := config.TLSConfig(cfg.CACertPath, cfg.NodeCertPath, cfg.NodeKeyPath)
 	if err != nil {
@@ -77,7 +80,7 @@ func run(cfg config.NodeConfig) error {
 		repl.OnPeerDown(context.Background(), nodeId)
 	}
 	nodeServer := server.New(mgr, store, xfer, repl)
-	api := httpapi.New(nodeServer, mgr, store, cfg.NodeId, cfg.HTTPAdvertise)
+	api := httpapi.New(nodeServer, mgr, store, cfg.NodeId, cfg.HTTPAdvertise, localICEServerURLs(cfg.STUNAdvertise))
 
 	grpcServer, err := startGRPCServer(cfg.ListenAddr, tlsCfg, nodeServer)
 	if err != nil {
@@ -85,6 +88,16 @@ func run(cfg config.NodeConfig) error {
 		return err
 	}
 	httpServer := startHTTPServer(cfg.HTTPListenAddr, api.Handler())
+	stunServer, err := startSTUNServer(cfg.STUNListenAddr)
+	if err != nil {
+		log.Error("node.stun.start", logging.Outcome(logging.OutcomeFailed), logging.Err(err))
+		return err
+	}
+	defer func() {
+		if closeErr := stunServer.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+			log.Warn("node.stun.close", logging.Outcome(logging.OutcomeFailed), logging.Err(closeErr))
+		}
+	}()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -114,6 +127,9 @@ func run(cfg config.NodeConfig) error {
 	defer httpShutdownCancel()
 	if err := httpServer.Shutdown(httpShutdownCtx); err != nil {
 		log.Warn("node.http.shutdown", logging.Outcome(logging.OutcomeFailed), logging.Err(err))
+	}
+	if err := stunServer.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		log.Warn("node.stun.shutdown", logging.Outcome(logging.OutcomeFailed), logging.Err(err))
 	}
 	grpcServer.GracefulStop()
 	log.Info("node.shutdown", logging.Outcome(logging.OutcomeSucceeded))
@@ -178,6 +194,21 @@ func startHTTPServer(listenAddr string, handler http.Handler) *http.Server {
 	return httpServer
 }
 
+func startSTUNServer(listenAddr string) (*stun.Server, error) {
+	log := logging.Component("main")
+	server, err := stun.Listen(listenAddr)
+	if err != nil {
+		return nil, fmt.Errorf("stun listen %s: %w", listenAddr, err)
+	}
+	go func() {
+		log.Info("node.stun.listen", logging.Outcome(logging.OutcomeSucceeded), "listen_addr", listenAddr)
+		if err := server.Serve(); err != nil && !errors.Is(err, net.ErrClosed) {
+			log.Error("node.stun.serve", logging.Outcome(logging.OutcomeFailed), logging.Err(err))
+		}
+	}()
+	return server, nil
+}
+
 func initializeMembership(ctx context.Context, cfg config.NodeConfig, mgr *membership.Manager, store *storage.Store) error {
 	log := logging.Component("main")
 	if len(cfg.BootstrapPeers) > 0 {
@@ -223,6 +254,8 @@ func parseFlags() config.NodeConfig {
 	listenAddr := flag.String("listen", ":9000", "gRPC listen address")
 	httpListenAddr := flag.String("http-listen", ":8081", "HTTP API listen address")
 	httpAdvertiseAddr := flag.String("http-advertise", "", "public HTTP address/base URL for browsers and inter-node signaling")
+	stunListenAddr := flag.String("stun-listen", ":3478", "UDP STUN listen address")
+	stunAdvertiseAddr := flag.String("stun-advertise", "", "public STUN URL for browsers, e.g. stun:node1.example.com:3478")
 	advertiseAddr := flag.String("advertise", "", "address peers use to dial this node (required)")
 	bootstrapPeers := flag.String("peers", "", "comma-separated bootstrap peer addresses")
 	dbPath := flag.String("db", "node.db", "SQLite DB path (use :memory: for ephemeral)")
@@ -248,6 +281,9 @@ func parseFlags() config.NodeConfig {
 	if *httpAdvertiseAddr == "" {
 		*httpAdvertiseAddr = deriveHTTPAdvertiseAddr(*advertiseAddr, *httpListenAddr)
 	}
+	if *stunAdvertiseAddr == "" {
+		*stunAdvertiseAddr = deriveSTUNAdvertiseAddr(*httpAdvertiseAddr)
+	}
 
 	var peers []string
 	if *bootstrapPeers != "" {
@@ -259,6 +295,8 @@ func parseFlags() config.NodeConfig {
 		ListenAddr:     *listenAddr,
 		HTTPListenAddr: *httpListenAddr,
 		HTTPAdvertise:  *httpAdvertiseAddr,
+		STUNListenAddr: *stunListenAddr,
+		STUNAdvertise:  *stunAdvertiseAddr,
 		AdvertiseAddr:  *advertiseAddr,
 		BootstrapPeers: peers,
 		DBPath:         *dbPath,
@@ -287,4 +325,31 @@ func deriveHTTPAdvertiseAddr(advertiseAddr, httpListenAddr string) string {
 		return net.JoinHostPort(host, "8081")
 	}
 	return net.JoinHostPort(httpHost, httpPort)
+}
+
+func deriveSTUNAdvertiseAddr(httpAdvertise string) string {
+	httpAdvertise = strings.TrimSpace(httpAdvertise)
+	if httpAdvertise == "" {
+		return ""
+	}
+	if !strings.Contains(httpAdvertise, "://") {
+		httpAdvertise = "http://" + httpAdvertise
+	}
+	parsed, err := neturl.Parse(httpAdvertise)
+	if err != nil || parsed.Host == "" {
+		return ""
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return ""
+	}
+	return "stun:" + net.JoinHostPort(host, "3478")
+}
+
+func localICEServerURLs(stunAdvertise string) []string {
+	stunAdvertise = strings.TrimSpace(stunAdvertise)
+	if stunAdvertise == "" {
+		return nil
+	}
+	return []string{stunAdvertise}
 }

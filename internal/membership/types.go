@@ -1,6 +1,7 @@
 package membership
 
 import (
+	"context"
 	"crypto/tls"
 	"sync"
 	"time"
@@ -55,6 +56,7 @@ type Manager struct {
 
 	heartbeatMu       sync.Mutex
 	heartbeatInFlight map[string]struct{}
+	probePeerFn       func(context.Context, Peer) error
 
 	replicaCount int
 	tlsCfg       *tls.Config

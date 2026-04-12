@@ -74,11 +74,11 @@ body{margin:0;min-height:100vh;background:radial-gradient(circle at 18% 14%,rgba
 .node-table tr:last-child td{border-bottom:0}
 .node-empty-cell{color:var(--ink-soft);text-align:center}
 .range-pie-card{border:1px solid var(--line);border-radius:10px;background:#f7fbff;padding:10px}
-.range-pie-layout{display:grid;grid-template-columns:250px 1fr;gap:12px;align-items:start}
-.range-pie{width:240px;height:240px;display:block}
+.range-pie-layout{display:grid;grid-template-columns:minmax(270px,300px) 1fr;gap:12px;align-items:start}
+.range-pie{width:min(100%,280px);height:auto;aspect-ratio:1/1;display:block;overflow:visible}
 .range-pie-segment{opacity:.95;stroke:#f7fbff;stroke-width:.9}
 .range-pie-core{fill:#fff;stroke:#cad7e3;stroke-width:1}
-.range-legend{margin:0;padding:0;list-style:none;max-height:220px;overflow:auto;display:grid;gap:4px}
+.range-legend{margin:0;padding:0;list-style:none;max-height:260px;overflow:auto;display:grid;gap:4px}
 .range-legend-row{display:grid;grid-template-columns:10px minmax(0,1fr) auto;gap:8px;align-items:center;font-size:.78rem;padding:3px 2px}
 .range-chip{width:10px;height:10px;border-radius:2px}
 .range-legend-label{color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}

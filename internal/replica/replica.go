@@ -104,6 +104,7 @@ func (m *Manager) ReplicateRecord(ctx context.Context, vnodeId string, rec stora
 				return err
 			})
 			if err != nil {
+				m.mgr.HandlePeerUnreachable(context.Background(), peer.NodeId, err)
 				log.Error("replica.dispatch.target", logging.Outcome(logging.OutcomeFailed), logging.AttrVnodeId, vnodeId, logging.AttrKey, rec.Key, logging.AttrPeerId, peer.NodeId, logging.AttrPeerAddr, peer.Address, "rank", rank+1, logging.Err(err))
 				return
 			}

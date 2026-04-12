@@ -297,6 +297,9 @@ func (a *App) aggregateClusterRecordsFromLogs() []keyActivityView {
 func (a *App) activeRingLocked() (*ring.Ring, int) {
 	entries := make([]ring.VnodeEntry, 0)
 	for _, node := range a.nodes {
+		if node.Status == statusOffline {
+			continue
+		}
 		for _, vnode := range node.Vnodes {
 			if !vnode.Active {
 				continue
