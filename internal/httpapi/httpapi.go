@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackstoller/p2p-messaging/internal/logging"
 	"github.com/jackstoller/p2p-messaging/internal/membership"
 	meshserver "github.com/jackstoller/p2p-messaging/internal/server"
 	"github.com/jackstoller/p2p-messaging/internal/storage"
@@ -396,6 +397,7 @@ func (a *API) handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "failed to save user")
 		return
 	}
+	logging.Info("New user signed up with username=%v, assigned node=%v.", username, a.nodeID)
 
 	writeJSON(w, http.StatusOK, authResponse{
 		Username:    username,
@@ -511,7 +513,7 @@ func (a *API) handlePeerConnect(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	_, ok := a.authenticate(r)
+	user, ok := a.authenticate(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "invalid session")
 		return
@@ -542,6 +544,7 @@ func (a *API) handlePeerConnect(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "target user not found")
 		return
 	}
+	logging.Info("New chat created between users with from=%v, to=%v.", user.Username, targetUsername)
 	writeJSON(w, http.StatusOK, connectResponse{
 		Target:     a.userView(target),
 		IceServers: iceServerEntries(target.CurrentICEServers),

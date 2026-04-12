@@ -44,24 +44,20 @@ func (m *Manager) DataClient(_ context.Context, addr string) (pb.DataServiceClie
 }
 
 func (m *Manager) dial(addr string) (*grpc.ClientConn, error) {
-	log := logging.Component("membership.clients")
 	m.clientsMu.Lock()
 	defer m.clientsMu.Unlock()
 
 	if cached, ok := m.clients[addr]; ok && time.Now().Before(cached.expiry) {
-		log.Debug("membership.client.dial", logging.Outcome(logging.OutcomeSucceeded), logging.AttrPeerAddr, addr, "cache", "hit")
 		return cached.conn, nil
 	}
 	if _, ok := m.clients[addr]; ok {
-		log.Debug("membership.client.dial", logging.Outcome(logging.OutcomeSkipped), logging.AttrPeerAddr, addr, "cache", "expired")
 	}
 
 	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(credentials.NewTLS(m.tlsCfg)))
 	if err != nil {
-		log.Error("membership.client.dial", logging.Outcome(logging.OutcomeFailed), logging.AttrPeerAddr, addr, logging.Err(err))
+		logging.Error("Failed to dial peer gRPC endpoint with peer addr=%v, error=%v.", addr, err)
 		return nil, fmt.Errorf("membership: dial %s: %w", addr, err)
 	}
 	m.clients[addr] = &cachedConn{conn: conn, expiry: time.Now().Add(connTTL)}
-	log.Info("membership.client.dial", logging.Outcome(logging.OutcomeSucceeded), logging.AttrPeerAddr, addr, "cache", "miss", logging.DurationMillis("ttl", connTTL))
 	return conn, nil
 }

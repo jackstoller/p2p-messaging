@@ -3,6 +3,14 @@
 
 `docker compose down -v && docker compose up --build`
 
+### Logging
+
+Default logs are normal mode (high-signal lifecycle and failure events).
+
+Enable verbose logs for deeper troubleshooting:
+
+`./node -verbose`
+
 ## Protocols
 
 ### Join Flow

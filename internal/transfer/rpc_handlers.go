@@ -14,32 +14,30 @@ import (
 )
 
 func (m *Manager) RequestRangeTransfer(_ context.Context, req *pb.RequestRangeTransferRequest) (*pb.RequestRangeTransferResponse, error) {
-	log := logging.Component("transfer")
-	log.Info("transfer.request_range", logging.Outcome(logging.OutcomeStarted), "transfer_id", req.GetTransferId(), "requestor_id", req.GetRequestor())
 	if req.TargetRange == nil || req.TransferId == "" || req.Requestor == "" {
-		log.Warn("transfer.request_range", logging.Outcome(logging.OutcomeRejected), "transfer_id", req.GetTransferId(), "requestor_id", req.GetRequestor(), "reason", "missing_required_fields")
+		logging.Warn("Rejected range transfer request because required fields are missing with transfer id=%v, requestor=%v.", req.GetTransferId(), req.GetRequestor())
 		return nil, errors.New("transfer: target_range, transfer_id, and requestor are required")
 	}
 
 	requestor, ok := m.mgr.PeerById(req.Requestor)
 	if !ok {
-		log.Warn("transfer.request_range", logging.Outcome(logging.OutcomeRejected), "transfer_id", req.TransferId, "requestor_id", req.Requestor, "reason", "requestor_not_found")
+		logging.Warn("Rejected range transfer request because requestor is unknown with transfer id=%v, requestor=%v.", req.TransferId, req.Requestor)
 		return &pb.RequestRangeTransferResponse{Accepted: false}, nil
 	}
 
 	targetVnode, ok := findVnodeByPosition(requestor, req.TargetRange.End)
 	if !ok {
-		log.Warn("transfer.request_range", logging.Outcome(logging.OutcomeRejected), "transfer_id", req.TransferId, logging.AttrPeerId, requestor.NodeId, "reason", "target_vnode_not_found", "range_end", req.TargetRange.End)
+		logging.Warn("Rejected range transfer request because target vnode was not found with transfer id=%v, requestor=%v, range end=%v.", req.TransferId, requestor.NodeId, req.TargetRange.End)
 		return &pb.RequestRangeTransferResponse{Accepted: false}, nil
 	}
 
 	owner, rangeStart, ok := m.currentOwnerForPosition(targetVnode.Position)
 	if !ok || owner.NodeId != m.mgr.SelfId() {
-		log.Warn("transfer.request_range", logging.Outcome(logging.OutcomeRejected), "transfer_id", req.TransferId, logging.AttrVnodeId, targetVnode.Id, "reason", "not_current_owner")
+		logging.Warn("Rejected range transfer request because this node is not the current owner with transfer id=%v, target vnode=%v.", req.TransferId, targetVnode.Id)
 		return &pb.RequestRangeTransferResponse{Accepted: false}, nil
 	}
 	if req.TargetRange.Start != rangeStart || req.TargetRange.End != targetVnode.Position {
-		log.Warn("transfer.request_range", logging.Outcome(logging.OutcomeRejected), "transfer_id", req.TransferId, logging.AttrVnodeId, targetVnode.Id, "reason", "range_mismatch", "expected_start", rangeStart, "expected_end", targetVnode.Position, "requested_start", req.TargetRange.Start, "requested_end", req.TargetRange.End)
+		logging.Warn("Rejected range transfer request because range did not match current ownership with transfer id=%v, target vnode=%v.", req.TransferId, targetVnode.Id)
 		return &pb.RequestRangeTransferResponse{Accepted: false}, nil
 	}
 
@@ -52,7 +50,7 @@ func (m *Manager) RequestRangeTransfer(_ context.Context, req *pb.RequestRangeTr
 		}
 	}
 	if !ownedActive {
-		log.Warn("transfer.request_range", logging.Outcome(logging.OutcomeRejected), "transfer_id", req.TransferId, "source_vnode_id", owner.Id, "reason", "source_inactive")
+		logging.Warn("Rejected range transfer request because source vnode is inactive with transfer id=%v, source vnode=%v.", req.TransferId, owner.Id)
 		return &pb.RequestRangeTransferResponse{Accepted: false}, nil
 	}
 
@@ -72,11 +70,10 @@ func (m *Manager) RequestRangeTransfer(_ context.Context, req *pb.RequestRangeTr
 	}
 
 	if !m.startOwnerTransfer(state) {
-		log.Warn("transfer.request_range", logging.Outcome(logging.OutcomeRejected), "transfer_id", req.TransferId, "source_vnode_id", owner.Id, logging.AttrVnodeId, targetVnode.Id, "reason", "owner_transfer_not_started")
+		logging.Warn("Rejected range transfer request because owner transfer state could not be started with transfer id=%v, source vnode=%v, target vnode=%v.", req.TransferId, owner.Id, targetVnode.Id)
 		return &pb.RequestRangeTransferResponse{Accepted: false}, nil
 	}
 
-	log.Info("transfer.request_range", logging.Outcome(logging.OutcomeSucceeded), "transfer_id", req.TransferId, "stream_id", state.StreamId, "requestor_id", requestor.NodeId, "source_vnode_id", owner.Id, "target_vnode_id", targetVnode.Id, "range_start", state.Range.Start, "range_end", state.Range.End)
 	return &pb.RequestRangeTransferResponse{Accepted: true}, nil
 }
 
@@ -90,22 +87,20 @@ func findVnodeByPosition(peer membership.Peer, position uint64) (membership.Vnod
 }
 
 func (m *Manager) StreamRange(req *pb.StreamRangeRequest, stream grpc.ServerStreamingServer[pb.RangeDataChunk]) error {
-	log := logging.Component("transfer")
-	log.Info("transfer.stream", logging.Outcome(logging.OutcomeStarted), "stream_id", req.GetTransferId())
 	if req.TransferId == 0 {
-		log.Warn("transfer.stream", logging.Outcome(logging.OutcomeRejected), "reason", "transfer_id_required")
+		logging.Warn("Rejected range stream because transfer id is missing.")
 		return errors.New("transfer: transfer_id is required")
 	}
 
 	state, ok := m.ownerTransferByStreamId(req.TransferId)
 	if !ok {
-		log.Warn("transfer.stream", logging.Outcome(logging.OutcomeRejected), "stream_id", req.TransferId, "reason", "transfer_not_found")
+		logging.Warn("Rejected range stream because transfer was not found with stream id=%v.", req.TransferId)
 		return errors.New("transfer: stream requested without accepted transfer")
 	}
 
 	records, err := m.store.GetRecordsByVnode(state.SourceVnodeId)
 	if err != nil {
-		log.Error("transfer.stream", logging.Outcome(logging.OutcomeFailed), "transfer_id", state.TransferId, "source_vnode_id", state.SourceVnodeId, logging.Err(err))
+		logging.Error("Failed to load records for range stream with transfer id=%v, source vnode=%v, error=%v.", state.TransferId, state.SourceVnodeId, err)
 		return err
 	}
 
@@ -119,12 +114,11 @@ func (m *Manager) StreamRange(req *pb.StreamRangeRequest, stream grpc.ServerStre
 	seq := int32(0)
 	if len(filtered) == 0 {
 		if err := stream.Send(finalRangeChunk(state.TransferId, seq)); err != nil {
-			log.Error("transfer.stream.final", logging.Outcome(logging.OutcomeFailed), "transfer_id", state.TransferId, "seq", seq, logging.Err(err))
+			logging.Error("Failed sending final empty range chunk with transfer id=%v, seq=%v, error=%v.", state.TransferId, seq, err)
 			return err
 		}
 		m.setOwnerTransferLive(state.TransferId)
 		_ = m.flushBufferedWrites(stream.Context(), state.TransferId)
-		log.Info("transfer.stream", logging.Outcome(logging.OutcomeSucceeded), "transfer_id", state.TransferId, "records", 0, "chunks", 1)
 		return nil
 	}
 
@@ -145,30 +139,26 @@ func (m *Manager) StreamRange(req *pb.StreamRangeRequest, stream grpc.ServerStre
 			IsFinal:    end == len(filtered),
 			Records:    chunkRecords,
 		}); err != nil {
-			log.Error("transfer.stream.chunk", logging.Outcome(logging.OutcomeFailed), "transfer_id", state.TransferId, "seq", seq, "records", len(chunkRecords), logging.Err(err))
+			logging.Error("Failed sending range chunk with transfer id=%v, seq=%v, records=%v, error=%v.", state.TransferId, seq, len(chunkRecords), err)
 			return err
 		}
-		log.Debug("transfer.stream.chunk", logging.Outcome(logging.OutcomeSucceeded), "transfer_id", state.TransferId, "seq", seq, "records", len(chunkRecords), "is_final", end == len(filtered))
 		seq++
 	}
 
 	m.setOwnerTransferLive(state.TransferId)
 	_ = m.flushBufferedWrites(stream.Context(), state.TransferId)
-	log.Info("transfer.stream", logging.Outcome(logging.OutcomeSucceeded), "transfer_id", state.TransferId, "records", len(filtered), "chunks", seq)
 	return nil
 }
 
 func (m *Manager) ForwardWrite(_ context.Context, req *pb.ForwardWriteRequest) (*pb.ForwardWriteResponse, error) {
-	log := logging.Component("transfer")
-	log.Info("transfer.forward_write", logging.Outcome(logging.OutcomeStarted), "write_id", req.GetWriteId(), logging.AttrKey, req.GetRecord().GetKey())
 	if req.Record == nil {
-		log.Warn("transfer.forward_write", logging.Outcome(logging.OutcomeRejected), "write_id", req.GetWriteId(), "reason", "record_required")
+		logging.Warn("Rejected forwarded write because record payload is missing with write id=%v.", req.GetWriteId())
 		return nil, errors.New("transfer: record is required")
 	}
 
 	claim, ok := m.claimForKey(req.Record.Key)
 	if !ok {
-		log.Warn("transfer.forward_write", logging.Outcome(logging.OutcomeRejected), "write_id", req.GetWriteId(), logging.AttrKey, req.Record.Key, "reason", "claim_not_found")
+		logging.Warn("Rejected forwarded write because no local claim is active for key with write id=%v, key=%v.", req.GetWriteId(), req.Record.Key)
 		return nil, fmt.Errorf("transfer: no local claim for key %s", req.Record.Key)
 	}
 
@@ -179,50 +169,46 @@ func (m *Manager) ForwardWrite(_ context.Context, req *pb.ForwardWriteRequest) (
 		Timestamp: req.Record.Timestamp,
 	})
 	if err != nil {
-		log.Error("transfer.forward_write", logging.Outcome(logging.OutcomeFailed), "write_id", req.GetWriteId(), logging.AttrKey, req.Record.Key, logging.AttrVnodeId, claim.TargetVnodeId, logging.Err(err))
+		logging.Error("Forwarded write failed with write id=%v, key=%v, vnode=%v, error=%v.", req.GetWriteId(), req.Record.Key, claim.TargetVnodeId, err)
 		return nil, err
 	}
-	log.Info("transfer.forward_write", logging.Outcome(logging.OutcomeSucceeded), "write_id", req.GetWriteId(), logging.AttrKey, req.Record.Key, logging.AttrVnodeId, claim.TargetVnodeId)
 	return &pb.ForwardWriteResponse{WriteId: req.WriteId}, nil
 }
 
 func (m *Manager) CompleteRangeTransfer(ctx context.Context, req *pb.CompleteRangeTransferRequest) (*pb.CompleteRangeTransferResponse, error) {
-	log := logging.Component("transfer")
-	log.Info("transfer.complete", logging.Outcome(logging.OutcomeStarted), "transfer_id", req.GetTransferId())
 	if req.TransferId == "" {
-		log.Warn("transfer.complete", logging.Outcome(logging.OutcomeRejected), "reason", "transfer_id_required")
+		logging.Warn("Rejected transfer completion because transfer id is missing.")
 		return nil, errors.New("transfer: transfer_id is required")
 	}
 
 	state, ok := m.ownerTransferById(req.TransferId)
 	if !ok {
-		log.Warn("transfer.complete", logging.Outcome(logging.OutcomeRejected), "transfer_id", req.TransferId, "reason", "transfer_not_found")
+		logging.Warn("Rejected transfer completion because transfer was not found with transfer id=%v.", req.TransferId)
 		return &pb.CompleteRangeTransferResponse{Accepted: false}, nil
 	}
 	if !state.LiveForwarding {
-		log.Warn("transfer.complete", logging.Outcome(logging.OutcomeRejected), "transfer_id", req.TransferId, "reason", "live_forwarding_not_ready")
+		logging.Warn("Rejected transfer completion because live forwarding is not ready with transfer id=%v.", req.TransferId)
 		return &pb.CompleteRangeTransferResponse{Accepted: false}, nil
 	}
 
 	if err := m.flushBufferedWrites(ctx, req.TransferId); err != nil {
-		log.Warn("transfer.complete", logging.Outcome(logging.OutcomeRejected), "transfer_id", req.TransferId, "reason", "flush_failed", logging.Err(err))
+		logging.Warn("Rejected transfer completion because buffered writes could not flush with transfer id=%v, error=%v.", req.TransferId, err)
 		return &pb.CompleteRangeTransferResponse{Accepted: false}, nil
 	}
 	if m.bufferedWriteCount(req.TransferId) > 0 {
-		log.Warn("transfer.complete", logging.Outcome(logging.OutcomeRejected), "transfer_id", req.TransferId, "reason", "buffer_not_empty", "buffered_writes", m.bufferedWriteCount(req.TransferId))
+		logging.Warn("Rejected transfer completion because buffered writes are still pending with transfer id=%v, buffered writes=%v.", req.TransferId, m.bufferedWriteCount(req.TransferId))
 		return &pb.CompleteRangeTransferResponse{Accepted: false}, nil
 	}
 	if !m.setOwnerTransferCutover(req.TransferId, true) {
-		log.Warn("transfer.complete", logging.Outcome(logging.OutcomeRejected), "transfer_id", req.TransferId, "reason", "cutover_not_set")
+		logging.Warn("Rejected transfer completion because cutover state was not set with transfer id=%v.", req.TransferId)
 		return &pb.CompleteRangeTransferResponse{Accepted: false}, nil
 	}
 
 	if err := m.store.DeleteRecordsInVnodeRange(state.SourceVnodeId, state.Range.Start, state.Range.End); err != nil {
 		m.setOwnerTransferCutover(req.TransferId, false)
-		log.Error("transfer.complete", logging.Outcome(logging.OutcomeFailed), "transfer_id", req.TransferId, "source_vnode_id", state.SourceVnodeId, logging.Err(err))
+		logging.Error("Transfer completion failed while deleting source range records with transfer id=%v, source vnode=%v, error=%v.", req.TransferId, state.SourceVnodeId, err)
 		return nil, err
 	}
-	log.Info("transfer.complete", logging.Outcome(logging.OutcomeSucceeded), "transfer_id", req.TransferId, "source_vnode_id", state.SourceVnodeId, "target_vnode_id", state.TargetVnodeId, "range_start", state.Range.Start, "range_end", state.Range.End)
 	return &pb.CompleteRangeTransferResponse{Accepted: true}, nil
 }
 

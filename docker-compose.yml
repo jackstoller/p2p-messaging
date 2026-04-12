@@ -93,28 +93,6 @@ services:
     depends_on:
       - node1
 
-  monitor:
-    build: .
-    entrypoint: ["/app/monitor"]
-    environment:
-      - COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME:-p2p-messaging}
-    command:
-      - "-listen=:8080"
-      - "-project-dir=/workspace"
-      - "-compose-file=/workspace/docker-compose.yml"
-      - "-tail=20000"
-    volumes:
-      - ./:/workspace:ro
-      - /var/run/docker.sock:/var/run/docker.sock
-    networks:
-      - mesh
-    ports:
-      - "${MONITOR_PORT:-8080}:8080"
-    depends_on:
-      - node1
-      - node2
-      - node3
-
 volumes:
   node1-data:
   node2-data:

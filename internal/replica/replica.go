@@ -27,7 +27,6 @@ type Manager struct {
 }
 
 func NewManager(mgr *membership.Manager, store *storage.Store) *Manager {
-	logging.Component("replica").Info("replica.manager.init", logging.Outcome(logging.OutcomeSucceeded))
 	return &Manager{
 		mgr:   mgr,
 		store: store,
@@ -36,18 +35,15 @@ func NewManager(mgr *membership.Manager, store *storage.Store) *Manager {
 }
 
 func (m *Manager) UpdateReplicaRank(_ context.Context, req *pb.UpdateReplicaRankRequest) (*pb.UpdateReplicaRankResponse, error) {
-	log := logging.Component("replica")
 	m.mu.Lock()
 	m.meta[req.VnodeId] = replicaMeta{PrimaryId: req.PrimaryId, Rank: req.NewRank}
 	m.mu.Unlock()
-	log.Info("replica.rank.update", logging.Outcome(logging.OutcomeSucceeded), logging.AttrVnodeId, req.VnodeId, "primary_id", req.PrimaryId, "new_rank", req.NewRank)
 	return &pb.UpdateReplicaRankResponse{}, nil
 }
 
 func (m *Manager) CreateReplica(_ context.Context, req *pb.CreateReplicaRequest) (*pb.CreateReplicaResponse, error) {
-	log := logging.Component("replica")
 	if req.Record == nil {
-		log.Warn("replica.create", logging.Outcome(logging.OutcomeRejected), logging.AttrVnodeId, req.VnodeId, "reason", "record_required")
+		logging.Warn("Rejected replica create because record payload is missing with vnode=%v.", req.VnodeId)
 		return nil, fmt.Errorf("replica: record is required")
 	}
 	_, err := m.store.UpsertRecord(storage.Record{
@@ -57,32 +53,26 @@ func (m *Manager) CreateReplica(_ context.Context, req *pb.CreateReplicaRequest)
 		Timestamp: req.Record.Timestamp,
 	})
 	if err != nil {
-		log.Error("replica.create", logging.Outcome(logging.OutcomeFailed), logging.AttrVnodeId, req.VnodeId, logging.AttrKey, req.Record.Key, logging.Err(err))
+		logging.Error("Replica create failed with vnode=%v, key=%v, error=%v.", req.VnodeId, req.Record.Key, err)
 		return nil, err
 	}
-	log.Info("replica.create", logging.Outcome(logging.OutcomeSucceeded), logging.AttrVnodeId, req.VnodeId, logging.AttrKey, req.Record.Key, "timestamp", req.Record.Timestamp)
 	return &pb.CreateReplicaResponse{Ack: true}, nil
 }
 
 // ReplicateRecord fans out a primary write to configured replica nodes.
 func (m *Manager) ReplicateRecord(ctx context.Context, vnodeId string, rec storage.Record) {
-	log := logging.Component("replica")
 	nodes := m.mgr.Ring.ResponsibleNodes(rec.Key, m.mgr.ReplicaCount()+1)
 	if len(nodes) <= 1 {
-		log.Debug("replica.repair.dispatch", logging.Outcome(logging.OutcomeSkipped), logging.AttrVnodeId, vnodeId, logging.AttrKey, rec.Key, "reason", "no_replica_targets")
 		return
 	}
-	log.Info("replica.dispatch", logging.Outcome(logging.OutcomeStarted), logging.AttrVnodeId, vnodeId, logging.AttrKey, rec.Key, "targets", len(nodes)-1)
 
 	for rank, n := range nodes[1:] {
 		if n.NodeId == m.mgr.SelfId() {
-			log.Debug("replica.dispatch.target", logging.Outcome(logging.OutcomeSkipped), logging.AttrVnodeId, vnodeId, logging.AttrKey, rec.Key, logging.AttrPeerId, n.NodeId, "reason", "self")
 			continue
 		}
 
 		peer, ok := m.mgr.PeerById(n.NodeId)
 		if !ok || peer.State == membership.PeerDown {
-			log.Warn("replica.dispatch.target", logging.Outcome(logging.OutcomeSkipped), logging.AttrVnodeId, vnodeId, logging.AttrKey, rec.Key, logging.AttrPeerId, n.NodeId, "reason", "peer_missing_or_down")
 			continue
 		}
 
@@ -105,10 +95,9 @@ func (m *Manager) ReplicateRecord(ctx context.Context, vnodeId string, rec stora
 			})
 			if err != nil {
 				m.mgr.HandlePeerUnreachable(context.Background(), peer.NodeId, err)
-				log.Error("replica.dispatch.target", logging.Outcome(logging.OutcomeFailed), logging.AttrVnodeId, vnodeId, logging.AttrKey, rec.Key, logging.AttrPeerId, peer.NodeId, logging.AttrPeerAddr, peer.Address, "rank", rank+1, logging.Err(err))
+				logging.Warn("Replica write to peer failed with vnode=%v, key=%v, peer=%v, rank=%v, error=%v.", vnodeId, rec.Key, peer.NodeId, rank+1, err)
 				return
 			}
-			log.Info("replica.dispatch.target", logging.Outcome(logging.OutcomeSucceeded), logging.AttrVnodeId, vnodeId, logging.AttrKey, rec.Key, logging.AttrPeerId, peer.NodeId, logging.AttrPeerAddr, peer.Address, "rank", rank+1)
 		}(rank, peer)
 	}
 }
@@ -126,42 +115,32 @@ func (m *Manager) OnVnodeActive(ctx context.Context, vnodeId string) {
 
 // OnTopologyChanged triggers best-effort replica repair from all currently
 // active local vnodes after the ring changes.
-func (m *Manager) OnTopologyChanged(ctx context.Context, reason string) {
-	log := logging.Component("replica")
-	log.Info("replica.topology_changed", logging.Outcome(logging.OutcomeStarted), "reason", reason)
-	repaired := m.repairAllLocalRecords(ctx)
-	log.Info("replica.topology_changed", logging.Outcome(logging.OutcomeSucceeded), "reason", reason, "repaired_vnodes", repaired)
+func (m *Manager) OnTopologyChanged(ctx context.Context, _ string) {
+	m.repairAllLocalRecords(ctx)
 }
 
 // repairReplicaSet replays current records for vnodeId to the currently
 // selected replica targets under the latest ring topology.
 func (m *Manager) repairReplicaSet(ctx context.Context, vnodeId string) {
-	log := logging.Component("replica")
-	log.Info("replica.repair", logging.Outcome(logging.OutcomeStarted), logging.AttrVnodeId, vnodeId)
 	records, err := m.store.GetRecordsByVnode(vnodeId)
 	if err != nil {
-		log.Error("replica.repair", logging.Outcome(logging.OutcomeFailed), logging.AttrVnodeId, vnodeId, logging.Err(err))
+		logging.Error("Replica repair failed while loading vnode records with vnode=%v, error=%v.", vnodeId, err)
 		return
 	}
 	for _, r := range records {
 		m.ReplicateRecord(ctx, vnodeId, r)
 	}
-	log.Info("replica.repair", logging.Outcome(logging.OutcomeSucceeded), logging.AttrVnodeId, vnodeId, "records", len(records))
 }
 
 // OnPeerDown triggers best-effort replica repair from currently active local vnodes.
-func (m *Manager) OnPeerDown(ctx context.Context, deadNodeId string) {
-	log := logging.Component("replica")
-	log.Warn("replica.peer_down", logging.Outcome(logging.OutcomeStarted), "dead_node_id", deadNodeId)
-	repaired := m.repairAllLocalRecords(ctx)
-	log.Info("replica.peer_down", logging.Outcome(logging.OutcomeSucceeded), "dead_node_id", deadNodeId, "repaired_vnodes", repaired)
+func (m *Manager) OnPeerDown(ctx context.Context, _ string) {
+	m.repairAllLocalRecords(ctx)
 }
 
 func (m *Manager) repairAllLocalRecords(ctx context.Context) int {
-	log := logging.Component("replica")
 	records, err := m.store.GetAllRecords()
 	if err != nil {
-		log.Error("replica.repair_all", logging.Outcome(logging.OutcomeFailed), logging.Err(err))
+		logging.Error("Replica repair-all failed while loading records with error=%v.", err)
 		return 0
 	}
 
@@ -171,6 +150,5 @@ func (m *Manager) repairAllLocalRecords(ctx context.Context) int {
 		repaired++
 	}
 
-	log.Info("replica.repair_all", logging.Outcome(logging.OutcomeSucceeded), "records", repaired)
 	return repaired
 }

@@ -36,41 +36,36 @@ func main() {
 	initLogger(cfg)
 
 	if err := run(cfg); err != nil {
-		logging.Component("main").Error("node.run", logging.Outcome(logging.OutcomeFailed), logging.Err(err))
+		logging.Error("Node stopped because startup failed with error=%v.", err)
 		os.Exit(1)
 	}
 }
 
 func initLogger(cfg config.NodeConfig) {
 	logging.Init(logging.Options{
-		Level:         logging.ParseLevel(cfg.LogLevel),
-		NodeId:        cfg.NodeId,
-		AdvertiseAddr: cfg.AdvertiseAddr,
+		Verbose: cfg.Verbose,
 	})
 }
 
 func run(cfg config.NodeConfig) error {
-	log := logging.Component("main")
-	log.Info("node.start", logging.Outcome(logging.OutcomeStarted), "listen_addr", cfg.ListenAddr, "http_listen_addr", cfg.HTTPListenAddr, "stun_listen_addr", cfg.STUNListenAddr, "bootstrap_peers", len(cfg.BootstrapPeers), "replica_count", cfg.ReplicaCount, "db_path", cfg.DBPath, "log_level", cfg.LogLevel)
+	logging.Info("Starting up node.")
 
 	tlsCfg, err := config.TLSConfig(cfg.CACertPath, cfg.NodeCertPath, cfg.NodeKeyPath)
 	if err != nil {
-		log.Error("node.tls.init", logging.Outcome(logging.OutcomeFailed), logging.Err(err))
+		logging.Error("TLS setup failed with error=%v.", err)
 		return fmt.Errorf("TLS config: %w", err)
 	}
-	log.Info("node.tls.init", logging.Outcome(logging.OutcomeSucceeded))
 
 	store, err := storage.Open(cfg.DBPath)
 	if err != nil {
-		log.Error("node.storage.open", logging.Outcome(logging.OutcomeFailed), "db_path", cfg.DBPath, logging.Err(err))
+		logging.Error("Could not open local storage with db path=%v, error=%v.", cfg.DBPath, err)
 		return fmt.Errorf("storage open: %w", err)
 	}
 	defer func() {
 		if closeErr := store.Close(); closeErr != nil {
-			log.Warn("node.storage.close", logging.Outcome(logging.OutcomeFailed), logging.Err(closeErr))
+			logging.Warn("Storage close reported an error with error=%v.", closeErr)
 			return
 		}
-		log.Info("node.storage.close", logging.Outcome(logging.OutcomeSucceeded))
 	}()
 
 	mgr := membership.NewManager(cfg.NodeId, cfg.AdvertiseAddr, cfg.ReplicaCount, tlsCfg)
@@ -84,18 +79,18 @@ func run(cfg config.NodeConfig) error {
 
 	grpcServer, err := startGRPCServer(cfg.ListenAddr, tlsCfg, nodeServer)
 	if err != nil {
-		log.Error("node.grpc.start", logging.Outcome(logging.OutcomeFailed), logging.Err(err))
+		logging.Error("Could not start gRPC server with error=%v.", err)
 		return err
 	}
 	httpServer := startHTTPServer(cfg.HTTPListenAddr, api.Handler())
 	stunServer, err := startSTUNServer(cfg.STUNListenAddr)
 	if err != nil {
-		log.Error("node.stun.start", logging.Outcome(logging.OutcomeFailed), logging.Err(err))
+		logging.Error("Could not start STUN server with error=%v.", err)
 		return err
 	}
 	defer func() {
 		if closeErr := stunServer.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
-			log.Warn("node.stun.close", logging.Outcome(logging.OutcomeFailed), logging.Err(closeErr))
+			logging.Warn("STUN server close reported an error with error=%v.", closeErr)
 		}
 	}()
 
@@ -103,43 +98,39 @@ func run(cfg config.NodeConfig) error {
 	defer cancel()
 
 	if err := initializeMembership(ctx, cfg, mgr, store); err != nil {
-		log.Error("node.membership.init", logging.Outcome(logging.OutcomeFailed), logging.Err(err))
+		logging.Error("Membership setup failed with error=%v.", err)
 		return err
 	}
-	log.Info("node.membership.init", logging.Outcome(logging.OutcomeSucceeded))
 	if err := claimPrimaryVirtualNodes(ctx, cfg, xfer); err != nil {
-		log.Error("node.vnode.claim", logging.Outcome(logging.OutcomeFailed), logging.Err(err))
+		logging.Error("Could not claim initial ranges with error=%v.", err)
 		return err
 	}
-	log.Info("node.vnode.claim", logging.Outcome(logging.OutcomeSucceeded))
 	if err := api.PublishNodeInfo(ctx); err != nil {
-		log.Warn("node.http.publish_info", logging.Outcome(logging.OutcomeFailed), logging.Err(err))
+		logging.Warn("Could not publish node info to peers yet with error=%v.", err)
 	} else {
-		log.Info("node.http.publish_info", logging.Outcome(logging.OutcomeSucceeded), "http_advertise", cfg.HTTPAdvertise)
 	}
 
-	startPeerMonitoring(ctx, mgr)
+	go mgr.RunHeartbeats(ctx)
+	logging.Info(fmt.Sprintf("Node has completed setup with %d active ranges.", mgr.Ring.Len()))
 
 	waitForShutdownSignal()
-	log.Info("node.shutdown", logging.Outcome(logging.OutcomeStarted))
+	logging.Info("Shutting down node.")
 	cancel()
 	httpShutdownCtx, httpShutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer httpShutdownCancel()
 	if err := httpServer.Shutdown(httpShutdownCtx); err != nil {
-		log.Warn("node.http.shutdown", logging.Outcome(logging.OutcomeFailed), logging.Err(err))
+		logging.Warn("HTTP server shutdown reported an error with error=%v.", err)
 	}
 	if err := stunServer.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-		log.Warn("node.stun.shutdown", logging.Outcome(logging.OutcomeFailed), logging.Err(err))
+		logging.Warn("STUN server shutdown reported an error with error=%v.", err)
 	}
 	grpcServer.GracefulStop()
-	log.Info("node.shutdown", logging.Outcome(logging.OutcomeSucceeded))
+	logging.Info("Node shutdown complete.")
 	return nil
 }
 
 func claimPrimaryVirtualNodes(ctx context.Context, cfg config.NodeConfig, xfer *transfer.Manager) error {
-	log := logging.Component("main")
 	if len(cfg.BootstrapPeers) == 0 {
-		log.Debug("node.vnode.claim.skipped", logging.Outcome(logging.OutcomeSkipped), "reason", "no_bootstrap_peers")
 		return nil
 	}
 	if err := xfer.ClaimVirtualNodes(ctx); err != nil {
@@ -148,13 +139,7 @@ func claimPrimaryVirtualNodes(ctx context.Context, cfg config.NodeConfig, xfer *
 	return nil
 }
 
-func startPeerMonitoring(ctx context.Context, mgr *membership.Manager) {
-	logging.Component("main").Info("node.heartbeat.loop", logging.Outcome(logging.OutcomeStarted))
-	go mgr.RunHeartbeats(ctx)
-}
-
 func startGRPCServer(listenAddr string, tlsCfg *tls.Config, node *server.Server) (*grpc.Server, error) {
-	log := logging.Component("main")
 	lis, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return nil, fmt.Errorf("listen %s: %w", listenAddr, err)
@@ -167,9 +152,8 @@ func startGRPCServer(listenAddr string, tlsCfg *tls.Config, node *server.Server)
 	pb.RegisterDataServiceServer(grpcServer, node)
 
 	go func() {
-		log.Info("node.grpc.listen", logging.Outcome(logging.OutcomeSucceeded), "listen_addr", listenAddr)
 		if serveErr := grpcServer.Serve(lis); serveErr != nil {
-			log.Error("node.grpc.serve", logging.Outcome(logging.OutcomeFailed), logging.Err(serveErr))
+			logging.Error("gRPC server stopped unexpectedly with error=%v.", serveErr)
 		}
 	}()
 
@@ -177,7 +161,6 @@ func startGRPCServer(listenAddr string, tlsCfg *tls.Config, node *server.Server)
 }
 
 func startHTTPServer(listenAddr string, handler http.Handler) *http.Server {
-	log := logging.Component("main")
 	httpServer := &http.Server{
 		Addr:              listenAddr,
 		Handler:           handler,
@@ -185,9 +168,8 @@ func startHTTPServer(listenAddr string, handler http.Handler) *http.Server {
 	}
 
 	go func() {
-		log.Info("node.http.listen", logging.Outcome(logging.OutcomeSucceeded), "listen_addr", listenAddr)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Error("node.http.serve", logging.Outcome(logging.OutcomeFailed), logging.Err(err))
+			logging.Error("HTTP server stopped unexpectedly with error=%v.", err)
 		}
 	}()
 
@@ -195,24 +177,20 @@ func startHTTPServer(listenAddr string, handler http.Handler) *http.Server {
 }
 
 func startSTUNServer(listenAddr string) (*stun.Server, error) {
-	log := logging.Component("main")
 	server, err := stun.Listen(listenAddr)
 	if err != nil {
 		return nil, fmt.Errorf("stun listen %s: %w", listenAddr, err)
 	}
 	go func() {
-		log.Info("node.stun.listen", logging.Outcome(logging.OutcomeSucceeded), "listen_addr", listenAddr)
 		if err := server.Serve(); err != nil && !errors.Is(err, net.ErrClosed) {
-			log.Error("node.stun.serve", logging.Outcome(logging.OutcomeFailed), logging.Err(err))
+			logging.Error("STUN server stopped unexpectedly with error=%v.", err)
 		}
 	}()
 	return server, nil
 }
 
 func initializeMembership(ctx context.Context, cfg config.NodeConfig, mgr *membership.Manager, store *storage.Store) error {
-	log := logging.Component("main")
 	if len(cfg.BootstrapPeers) > 0 {
-		log.Info("node.membership.join", logging.Outcome(logging.OutcomeStarted), "bootstrap_peers", len(cfg.BootstrapPeers))
 		if err := mgr.Join(ctx, cfg.BootstrapPeers); err != nil {
 			return fmt.Errorf("join mesh: %w", err)
 		}
@@ -220,26 +198,22 @@ func initializeMembership(ctx context.Context, cfg config.NodeConfig, mgr *membe
 		// If no active ranges exist yet, this node is effectively the first live node.
 		// Activate local vnodes so the ring can begin serving traffic.
 		if mgr.Ring.Len() == 0 {
-			log.Info("node.membership.first_live_node", logging.Outcome(logging.OutcomeStarted))
 			mgr.ActivateSelf()
 			for _, vn := range mgr.Self().Vnodes {
 				if err := store.SetVnodeState(vn.Id, vn.Position, storage.OwnedVnodeStateActive); err != nil {
 					return fmt.Errorf("persist self vnode %s: %w", vn.Id, err)
 				}
 			}
-			log.Info("node.membership.first_live_node", logging.Outcome(logging.OutcomeSucceeded), "activated_vnodes", len(mgr.Self().Vnodes))
 		}
 		return nil
 	}
 
-	log.Info("node.membership.bootstrap_absent", logging.Outcome(logging.OutcomeStarted))
 	mgr.ActivateSelf()
 	for _, vn := range mgr.Self().Vnodes {
 		if err := store.SetVnodeState(vn.Id, vn.Position, storage.OwnedVnodeStateActive); err != nil {
 			return fmt.Errorf("persist self vnode %s: %w", vn.Id, err)
 		}
 	}
-	log.Info("node.membership.bootstrap_absent", logging.Outcome(logging.OutcomeSucceeded), "activated_vnodes", len(mgr.Self().Vnodes))
 	return nil
 }
 
@@ -260,7 +234,8 @@ func parseFlags() config.NodeConfig {
 	bootstrapPeers := flag.String("peers", "", "comma-separated bootstrap peer addresses")
 	dbPath := flag.String("db", "node.db", "SQLite DB path (use :memory: for ephemeral)")
 	replicaCount := flag.Int("replicas", 2, "number of replicas per key (min 1)")
-	logLevel := flag.String("log-level", "debug", "log verbosity: debug, info, warn, error")
+	verbose := flag.Bool("verbose", false, "enable verbose logging")
+	logLevel := flag.String("log-level", "", "deprecated: use -verbose; 'verbose' or 'debug' still enables verbose logs")
 	caCert := flag.String("ca-cert", "certs/ca.crt", "path to CA certificate")
 	nodeCert := flag.String("node-cert", "certs/node.crt", "path to this node's certificate")
 	nodeKey := flag.String("node-key", "certs/node.key", "path to this node's private key")
@@ -301,7 +276,7 @@ func parseFlags() config.NodeConfig {
 		BootstrapPeers: peers,
 		DBPath:         *dbPath,
 		ReplicaCount:   *replicaCount,
-		LogLevel:       *logLevel,
+		Verbose:        *verbose || logging.ParseLevel(*logLevel),
 		CACertPath:     *caCert,
 		NodeCertPath:   *nodeCert,
 		NodeKeyPath:    *nodeKey,

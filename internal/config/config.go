@@ -19,7 +19,7 @@ type NodeConfig struct {
 	BootstrapPeers []string // addresses of seed nodes, empty if first in network
 	DBPath         string   // SQLite file path, ":memory:" for in-memory
 	ReplicaCount   int
-	LogLevel       string
+	Verbose        bool
 
 	CACertPath   string
 	NodeCertPath string

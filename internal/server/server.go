@@ -1,7 +1,6 @@
 package server
 
 import (
-	"github.com/jackstoller/p2p-messaging/internal/logging"
 	"github.com/jackstoller/p2p-messaging/internal/membership"
 	"github.com/jackstoller/p2p-messaging/internal/replica"
 	"github.com/jackstoller/p2p-messaging/internal/storage"
@@ -24,6 +23,5 @@ type Server struct {
 
 // New creates a Server.
 func New(mgr *membership.Manager, store *storage.Store, xfer *transfer.Manager, repl *replica.Manager) *Server {
-	logging.Component("server").Info("server.init", logging.Outcome(logging.OutcomeSucceeded), "services", 4)
 	return &Server{mgr: mgr, store: store, xfer: xfer, repl: repl}
 }

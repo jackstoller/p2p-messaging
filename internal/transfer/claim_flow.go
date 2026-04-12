@@ -23,14 +23,12 @@ const maxConcurrentClaims = 8
 // Attempts to activate all inactive virtual nodes by transferring
 // ranges to itself and activating
 func (m *Manager) ClaimVirtualNodes(ctx context.Context) error {
-	log := logging.Component("transfer.claim")
 	self := m.mgr.Self()
 	targets := m.getInactiveVnodes(self)
 	if len(targets) == 0 {
-		log.Info("transfer.claim.virtual_nodes", logging.Outcome(logging.OutcomeSkipped), "reason", "no_inactive_vnodes")
 		return nil
 	}
-	log.Info("transfer.claim.virtual_nodes", logging.Outcome(logging.OutcomeStarted), "targets", len(targets))
+	logging.Info(fmt.Sprintf("Starting vnode claim flow with %d targets.", len(targets)))
 
 	errCh := make(chan error, len(targets))
 	var wg sync.WaitGroup
@@ -51,11 +49,11 @@ func (m *Manager) ClaimVirtualNodes(ctx context.Context) error {
 	close(errCh)
 	for err := range errCh {
 		if err != nil {
-			log.Error("transfer.claim.virtual_nodes", logging.Outcome(logging.OutcomeFailed), logging.Err(err))
+			logging.Error("Vnode claim flow failed with error=%v.", err)
 			return err
 		}
 	}
-	log.Info("transfer.claim.virtual_nodes", logging.Outcome(logging.OutcomeSucceeded), "targets", len(targets))
+	logging.Info(fmt.Sprintf("Completed vnode claim flow with %d targets.", len(targets)))
 	return nil
 }
 
@@ -92,16 +90,12 @@ func (m *Manager) getInactiveVnodes(self membership.Peer) []membership.Vnode {
 }
 
 func (m *Manager) claimVnode(ctx context.Context, vnode membership.Vnode) error {
-	log := logging.Component("transfer.claim")
-	log.Info("transfer.claim.vnode", logging.Outcome(logging.OutcomeStarted), logging.AttrVnodeId, vnode.Id, "position", vnode.Position)
 
 	if owner, _, ok := m.currentOwnerForPosition(vnode.Position); ok && owner.NodeId == m.mgr.SelfId() {
-		log.Info("transfer.claim.vnode", logging.Outcome(logging.OutcomeSkipped), logging.AttrVnodeId, vnode.Id, "reason", "already_owned_after_rebuild")
 		if err := m.activateTargetRange(ctx, m.mgr.SelfId(), vnode.Id, vnode.Position); err != nil {
-			log.Error("transfer.claim.activate", logging.Outcome(logging.OutcomeFailed), logging.AttrVnodeId, vnode.Id, logging.Err(err))
+			logging.Error("Failed to activate vnode without transfer with vnode id=%v, error=%v.", vnode.Id, err)
 			return err
 		}
-		log.Info("transfer.claim.vnode", logging.Outcome(logging.OutcomeSucceeded), logging.AttrVnodeId, vnode.Id, "reason", "activated_without_transfer")
 		return nil
 	}
 
@@ -110,41 +104,38 @@ func (m *Manager) claimVnode(ctx context.Context, vnode membership.Vnode) error 
 	if err != nil {
 		if errors.Is(err, errAlreadyOwner) {
 			if activateErr := m.activateTargetRange(ctx, m.mgr.SelfId(), vnode.Id, vnode.Position); activateErr != nil {
-				log.Error("transfer.claim.activate", logging.Outcome(logging.OutcomeFailed), logging.AttrVnodeId, vnode.Id, logging.Err(activateErr))
+				logging.Error("Failed to activate vnode after owner retry with vnode id=%v, error=%v.", vnode.Id, activateErr)
 				return activateErr
 			}
-			log.Info("transfer.claim.vnode", logging.Outcome(logging.OutcomeSucceeded), logging.AttrVnodeId, vnode.Id, "reason", "activated_after_retry")
 			return nil
 		}
-		log.Error("transfer.claim.vnode", logging.Outcome(logging.OutcomeFailed), logging.AttrVnodeId, vnode.Id, logging.Err(err))
+		logging.Error("Failed to acquire transfer plan for vnode with vnode id=%v, error=%v.", vnode.Id, err)
 		return err
 	}
 	m.registerClaim(plan, vnode)
 	defer m.unregisterClaim(plan.TransferId)
 
 	if err := m.streamSnapshot(ctx, plan); err != nil {
-		log.Error("transfer.claim.snapshot", logging.Outcome(logging.OutcomeFailed), logging.AttrVnodeId, vnode.Id, "transfer_id", plan.TransferId, logging.Err(err))
+		logging.Error("Snapshot transfer failed during vnode claim with vnode id=%v, transfer id=%v, error=%v.", vnode.Id, plan.TransferId, err)
 		return err
 	}
 
 	if err := m.completeTransferWithRetry(ctx, plan); err != nil {
-		log.Error("transfer.claim.complete", logging.Outcome(logging.OutcomeFailed), logging.AttrVnodeId, vnode.Id, "transfer_id", plan.TransferId, logging.Err(err))
+		logging.Error("Failed to finalize transfer during vnode claim with vnode id=%v, transfer id=%v, error=%v.", vnode.Id, plan.TransferId, err)
 		return err
 	}
 
 	if err := m.activateTargetRange(ctx, m.mgr.SelfId(), vnode.Id, vnode.Position); err != nil {
-		log.Error("transfer.claim.activate", logging.Outcome(logging.OutcomeFailed), logging.AttrVnodeId, vnode.Id, "transfer_id", plan.TransferId, logging.Err(err))
+		logging.Error("Failed to activate vnode after transfer with vnode id=%v, transfer id=%v, error=%v.", vnode.Id, plan.TransferId, err)
 		return err
 	}
 
-	log.Info("transfer.claim.vnode", logging.Outcome(logging.OutcomeSucceeded), logging.AttrVnodeId, vnode.Id, "transfer_id", plan.TransferId, "owner_node_id", plan.OwnerNodeId, "range_start", plan.Range.Start, "range_end", plan.Range.End)
 	return nil
 }
 
 // Returns an accepted transfer plan. Retires on error until
 // accepted or failure
 func (m *Manager) acquireAcceptedTransferPlan(ctx context.Context, vnode membership.Vnode) (rangeTransferPlan, error) {
-	log := logging.Component("transfer.claim")
 	var plan rangeTransferPlan
 
 	err := util.Do(ctx, util.RangeClaimBackoff, func() error {
@@ -154,11 +145,9 @@ func (m *Manager) acquireAcceptedTransferPlan(ctx context.Context, vnode members
 			if errors.Is(err, errAlreadyOwner) {
 				return err
 			}
-			log.Warn("transfer.claim.plan", logging.Outcome(logging.OutcomeFailed), logging.AttrVnodeId, vnode.Id, logging.Err(err))
 			return err
 		}
 		plan = computedPlan
-		log.Info("transfer.claim.plan", logging.Outcome(logging.OutcomeStarted), logging.AttrVnodeId, vnode.Id, "transfer_id", plan.TransferId, "owner_node_id", plan.OwnerNodeId, "range_start", plan.Range.Start, "range_end", plan.Range.End)
 
 		// Get the owner's address
 		peer, success := m.mgr.PeerById(plan.OwnerNodeId)
@@ -167,10 +156,17 @@ func (m *Manager) acquireAcceptedTransferPlan(ctx context.Context, vnode members
 		}
 		plan.OwnerAddr = peer.Address
 
+		// Ensure the owner has a current membership record for this node before
+		// requesting a range transfer. During startup, UP broadcasts may still
+		// be in flight and would otherwise cause transient "requestor unknown"
+		// rejections.
+		if err := m.ensureRegisteredWithOwner(ctx, peer.Address); err != nil {
+			return fmt.Errorf("register with owner %s: %w", plan.OwnerNodeId, err)
+		}
+
 		client, err := m.mgr.TransferClient(ctx, peer.Address)
 		if err != nil {
 			m.mgr.HandlePeerUnreachable(context.Background(), peer.NodeId, err)
-			log.Warn("transfer.claim.plan", logging.Outcome(logging.OutcomeFailed), logging.AttrVnodeId, vnode.Id, logging.AttrPeerId, peer.NodeId, logging.AttrPeerAddr, peer.Address, logging.Err(err))
 			return err
 		}
 		resp, err := client.RequestRangeTransfer(ctx, &pb.RequestRangeTransferRequest{
@@ -183,19 +179,33 @@ func (m *Manager) acquireAcceptedTransferPlan(ctx context.Context, vnode members
 		})
 		if err != nil {
 			m.mgr.HandlePeerUnreachable(context.Background(), peer.NodeId, err)
-			log.Warn("transfer.claim.plan", logging.Outcome(logging.OutcomeFailed), logging.AttrVnodeId, vnode.Id, "transfer_id", plan.TransferId, logging.Err(err))
 			return err
 		}
 		if !resp.Accepted {
-			log.Warn("transfer.claim.plan", logging.Outcome(logging.OutcomeRejected), logging.AttrVnodeId, vnode.Id, "transfer_id", plan.TransferId, logging.AttrPeerId, peer.NodeId)
 			return errors.New("transfer request rejected")
 		}
-		log.Info("transfer.claim.plan", logging.Outcome(logging.OutcomeSucceeded), logging.AttrVnodeId, vnode.Id, "transfer_id", plan.TransferId, logging.AttrPeerId, peer.NodeId, logging.AttrPeerAddr, peer.Address)
 
 		return nil
 	})
 
 	return plan, err
+}
+
+func (m *Manager) ensureRegisteredWithOwner(ctx context.Context, ownerAddr string) error {
+	client, err := m.mgr.MembershipClient(ctx, ownerAddr)
+	if err != nil {
+		return err
+	}
+
+	resp, err := client.RegisterNode(ctx, &pb.RegisterNodeRequest{Member: m.mgr.SelfProto()})
+	if err != nil {
+		return err
+	}
+	if !resp.GetAccepted() {
+		return errors.New("membership registration rejected by owner")
+	}
+
+	return nil
 }
 
 type rangeTransferPlan struct {
@@ -209,17 +219,14 @@ type rangeTransferPlan struct {
 }
 
 func (m *Manager) computeRangeTransferPlan(vnode membership.Vnode) (rangeTransferPlan, error) {
-	log := logging.Component("transfer.claim")
 	owner, rangeStart, success := m.currentOwnerForPosition(vnode.Position)
 	if !success {
 		// No current owner, error
-		log.Warn("transfer.claim.plan.compute", logging.Outcome(logging.OutcomeFailed), logging.AttrVnodeId, vnode.Id, "reason", "no_current_owner")
 		return rangeTransferPlan{}, fmt.Errorf("no current owner found for vnode %s", vnode.Id)
 	}
 
 	if owner.NodeId == m.mgr.SelfId() {
 		// Self is already the owner, error
-		log.Warn("transfer.claim.plan.compute", logging.Outcome(logging.OutcomeRejected), logging.AttrVnodeId, vnode.Id, "reason", "self_already_owner")
 		return rangeTransferPlan{}, errAlreadyOwner
 	}
 
@@ -239,7 +246,6 @@ func (m *Manager) computeRangeTransferPlan(vnode membership.Vnode) (rangeTransfe
 			NodeId:  m.mgr.SelfId(),
 		},
 	}
-	log.Info("transfer.claim.plan.compute", logging.Outcome(logging.OutcomeSucceeded), logging.AttrVnodeId, vnode.Id, "transfer_id", plan.TransferId, "owner_node_id", plan.OwnerNodeId, "owner_vnode_id", plan.OwnerVnodeId, "range_start", plan.Range.Start, "range_end", plan.Range.End)
 	return plan, nil
 }
 
@@ -252,18 +258,16 @@ func (m *Manager) currentOwnerForPosition(pos uint64) (ring.VnodeEntry, uint64, 
 }
 
 func (m *Manager) streamSnapshot(ctx context.Context, plan rangeTransferPlan) error {
-	log := logging.Component("transfer.claim")
-	log.Info("transfer.claim.snapshot", logging.Outcome(logging.OutcomeStarted), "transfer_id", plan.TransferId, logging.AttrPeerId, plan.OwnerNodeId, logging.AttrPeerAddr, plan.OwnerAddr, "target_vnode_id", plan.TargetVnodeId)
 	client, err := m.mgr.TransferClient(ctx, plan.OwnerAddr)
 	if err != nil {
 		m.mgr.HandlePeerUnreachable(context.Background(), plan.OwnerNodeId, err)
-		log.Error("transfer.claim.snapshot", logging.Outcome(logging.OutcomeFailed), "transfer_id", plan.TransferId, logging.AttrPeerAddr, plan.OwnerAddr, logging.Err(err))
+		logging.Error("Failed to open transfer client for snapshot with transfer id=%v, peer addr=%v, error=%v.", plan.TransferId, plan.OwnerAddr, err)
 		return err
 	}
 	stream, err := client.StreamRange(ctx, &pb.StreamRangeRequest{TransferId: plan.StreamId})
 	if err != nil {
 		m.mgr.HandlePeerUnreachable(context.Background(), plan.OwnerNodeId, err)
-		log.Error("transfer.claim.snapshot", logging.Outcome(logging.OutcomeFailed), "transfer_id", plan.TransferId, logging.Err(err))
+		logging.Error("Snapshot stream RPC failed with transfer id=%v, error=%v.", plan.TransferId, err)
 		return fmt.Errorf("stream range %s: %w", plan.TransferId, err)
 	}
 	recordsApplied := 0
@@ -271,19 +275,17 @@ func (m *Manager) streamSnapshot(ctx context.Context, plan rangeTransferPlan) er
 	for {
 		chunk, err := stream.Recv()
 		if err == io.EOF {
-			log.Debug("transfer.claim.snapshot.recv", logging.Outcome(logging.OutcomeSucceeded), "transfer_id", plan.TransferId, "reason", "eof")
 			break
 		}
 		if err != nil {
 			m.mgr.HandlePeerUnreachable(context.Background(), plan.OwnerNodeId, err)
-			log.Error("transfer.claim.snapshot.recv", logging.Outcome(logging.OutcomeFailed), "transfer_id", plan.TransferId, logging.Err(err))
+			logging.Error("Snapshot stream receive failed with transfer id=%v, error=%v.", plan.TransferId, err)
 			return fmt.Errorf("stream recv %s: %w", plan.TransferId, err)
 		}
 		if chunk.TransferId != plan.TransferId {
-			log.Error("transfer.claim.snapshot.recv", logging.Outcome(logging.OutcomeFailed), "transfer_id", plan.TransferId, "received_transfer_id", chunk.TransferId, "reason", "transfer_id_mismatch")
+			logging.Error("Snapshot stream transfer id mismatch with transfer id=%v, received transfer id=%v.", plan.TransferId, chunk.TransferId)
 			return fmt.Errorf("streamed transfer mismatch: expected %s, got %s", plan.TransferId, chunk.TransferId)
 		}
-		log.Debug("transfer.claim.snapshot.chunk", logging.Outcome(logging.OutcomeSucceeded), "transfer_id", plan.TransferId, "seq", chunk.Seq, "records", len(chunk.Records), "is_final", chunk.IsFinal)
 		for _, rec := range chunk.Records {
 			_, err := m.store.UpsertRecord(storage.Record{
 				Key:       rec.Key,
@@ -292,7 +294,7 @@ func (m *Manager) streamSnapshot(ctx context.Context, plan rangeTransferPlan) er
 				Timestamp: rec.Timestamp,
 			})
 			if err != nil {
-				log.Error("transfer.claim.snapshot.apply", logging.Outcome(logging.OutcomeFailed), "transfer_id", plan.TransferId, logging.AttrKey, rec.Key, logging.Err(err))
+				logging.Error("Failed applying streamed record with transfer id=%v, key=%v, error=%v.", plan.TransferId, rec.Key, err)
 				return fmt.Errorf("apply streamed record %s: %w", rec.Key, err)
 			}
 			recordsApplied++
@@ -301,17 +303,14 @@ func (m *Manager) streamSnapshot(ctx context.Context, plan rangeTransferPlan) er
 			break
 		}
 	}
-	log.Info("transfer.claim.snapshot", logging.Outcome(logging.OutcomeSucceeded), "transfer_id", plan.TransferId, "records_applied", recordsApplied)
 	return nil
 }
 
 func (m *Manager) completeTransferWithRetry(ctx context.Context, plan rangeTransferPlan) error {
-	log := logging.Component("transfer.claim")
-	log.Info("transfer.claim.complete", logging.Outcome(logging.OutcomeStarted), "transfer_id", plan.TransferId, logging.AttrPeerId, plan.OwnerNodeId, logging.AttrPeerAddr, plan.OwnerAddr)
 	client, err := m.mgr.TransferClient(ctx, plan.OwnerAddr)
 	if err != nil {
 		m.mgr.HandlePeerUnreachable(context.Background(), plan.OwnerNodeId, err)
-		log.Error("transfer.claim.complete", logging.Outcome(logging.OutcomeFailed), "transfer_id", plan.TransferId, logging.Err(err))
+		logging.Error("Failed to open transfer client for completion with transfer id=%v, error=%v.", plan.TransferId, err)
 		return err
 	}
 
@@ -319,17 +318,14 @@ func (m *Manager) completeTransferWithRetry(ctx context.Context, plan rangeTrans
 		resp, err := client.CompleteRangeTransfer(ctx, &pb.CompleteRangeTransferRequest{TransferId: plan.TransferId})
 		if err != nil {
 			m.mgr.HandlePeerUnreachable(context.Background(), plan.OwnerNodeId, err)
-			log.Warn("transfer.claim.complete", logging.Outcome(logging.OutcomeFailed), "transfer_id", plan.TransferId, logging.Err(err))
 			return err
 		}
 		if !resp.Accepted {
-			log.Warn("transfer.claim.complete", logging.Outcome(logging.OutcomeRejected), "transfer_id", plan.TransferId)
 			return errors.New("transfer complete rejected")
 		}
-		log.Info("transfer.claim.complete", logging.Outcome(logging.OutcomeSucceeded), "transfer_id", plan.TransferId)
 		return nil
 	}); err != nil {
-		log.Error("transfer.claim.complete", logging.Outcome(logging.OutcomeFailed), "transfer_id", plan.TransferId, logging.Err(err))
+		logging.Error("Failed to complete transfer after retries with transfer id=%v, error=%v.", plan.TransferId, err)
 		return fmt.Errorf("complete transfer %s: %w", plan.TransferId, err)
 	}
 	return nil
